@@ -1,0 +1,892 @@
+import { clinics, defaultSelection, disclosure, hasConflict, toFhir } from "./case.mjs";
+import { session, request as api, loadSession, login, logout, outbox, queueAcceptance, flushOutbox, discardQueued } from "./sync-client.mjs";
+
+const byId = id => document.getElementById(id);
+const draft = { clinic: "north", fields: [...defaultSelection], cleaned: false, language: "en", printMode: "full" };
+const labels = [
+  ["result", "Lab result", "Hemoglobin measurement"],
+  ["history", "Medical history", "History of depression"],
+  ["note", "Referral note", "Message from the referring clinician"]
+];
+let step = 0;
+let issued;
+let submitting = false;
+let issuerKey;
+let offlineShell = false;
+let activePass;
+let verifyAttempt = 0;
+let cameraStream;
+let cameraAttempt = 0;
+let referrals = [];
+let syncBusy = false;
+let activeAccountId;
+let selectedReferral;
+let listMarkup = "";
+let outboxMarkup = "";
+
+function safe(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[char]);
+}
+
+function message(id, text = "", error = false) {
+  const node = byId(id);
+  node.textContent = text;
+  node.classList.toggle("error", error);
+}
+
+function entryMarkup(items, conflict = false) {
+  return items.map(item => {
+    const text = safe(item.text);
+    const content = item.id === "note" && conflict
+      ? text.replace("History of depression", "<mark>History of depression</mark>") : text;
+    return `<section class="entry"><h3>${safe(item.label)}</h3><p>${content}</p></section>`;
+  }).join("");
+}
+
+function replacePreservingFocus(node, content) {
+  const focused = node.contains(document.activeElement) && document.activeElement.id;
+  node.innerHTML = content;
+  if (focused) (byId(focused) ?? node.querySelector("[tabindex='-1']"))?.focus({ preventScroll: true });
+}
+
+function downloadFhir(pass, prefix) {
+  const file = new Blob([JSON.stringify(toFhir(pass), null, 2)], { type: "application/fhir+json" });
+  const url = URL.createObjectURL(file);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = prefix + "-" + pass.id + ".json";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+function renderPreview() {
+  const selected = disclosure(draft.fields, draft.cleaned);
+  const minimal = (issued?.pass.printMode ?? draft.printMode) === "minimal";
+  const items = issued?.pass.items ?? (minimal ? selected.filter(item => item.id === "result") : selected);
+  byId("preview-items").innerHTML = entryMarkup(items, hasConflict(draft.fields, draft.cleaned)) ||
+    '<p class="muted">No clinical details are printed in this pass.</p>';
+  byId("online-preview").innerHTML = minimal
+    ? '<section class="online-preview"><h3>Available to the signed-in clinic online</h3>' +
+      entryMarkup(issued?.onlineItems ?? selected, hasConflict(draft.fields, draft.cleaned)) + '</section>' : "";
+  byId("preview-clinic").textContent = clinics[draft.clinic];
+  byId("sheet-status").textContent = issued ? "Signed pass" : "Draft preview";
+}
+
+function previewControls() {
+  return `<h2>What to include</h2>
+    <label class="label" for="recipient">Receiving clinic</label>
+    <select id="recipient">${Object.entries(clinics).map(([id, name]) =>
+      `<option value="${id}" ${draft.clinic === id ? "selected" : ""}>${name}</option>`).join("")}</select>
+    <fieldset><legend>From your record</legend>${labels.map(([id, label, description]) =>
+      `<label class="field"><input type="checkbox" value="${id}" ${draft.fields.includes(id) ? "checked" : ""}>
+      <span><strong>${label}</strong><small>${description}</small></span></label>`).join("")}</fieldset>
+    <label class="label" for="print-mode">Information on the paper and QR</label>
+    <select id="print-mode"><option value="full" ${draft.printMode === "full" ? "selected" : ""}>All approved items</option>
+    <option value="minimal" ${draft.printMode === "minimal" ? "selected" : ""} ${!session.enabled || !session.user || session.user.clinic ? "disabled" : ""}>Lab result only; other items online</option></select>
+    <p class="muted mode-help">Anyone holding the paper or QR can read the printed items.</p>
+    <div id="conflict"></div>
+    <div class="buttons"><button id="continue">Review consent</button></div>`;
+}
+
+function updateConflict() {
+  const conflict = hasConflict(draft.fields, draft.cleaned);
+  byId("conflict").innerHTML = conflict
+    ? '<div class="warning"><p>You left out medical history, but the referral note still mentions it.</p><button class="secondary" id="clean-note">Use a note without medical history</button></div>'
+    : (draft.cleaned && draft.fields.includes("note") ? '<p class="muted">Sharing the note with medical history removed.</p>' : '');
+  byId("continue").disabled = conflict || draft.fields.length === 0;
+  renderPreview();
+}
+
+function readback() {
+  const details = disclosure(draft.fields, draft.cleaned).map(item => item.text).join(". ");
+  if (draft.language === "hi") {
+    const has = id => draft.fields.includes(id);
+    const recipient = draft.clinic === "north" ? "नॉर्थ क्लिनिक" : "साउथ क्लिनिक";
+    const items = [
+      has("result") && "हीमोग्लोबिन का नतीजा, 12.8 ग्राम प्रति डेसीलीटर",
+      has("history") && "अवसाद का इतिहास",
+      has("note") && (hasConflict(draft.fields, draft.cleaned) || (!draft.cleaned && has("history"))
+        ? "रेफ़रल नोट, जिसमें हीमोग्लोबिन की जाँच और अवसाद के इतिहास का उल्लेख है"
+        : "रेफ़रल नोट, जिसमें अगली मुलाक़ात में हीमोग्लोबिन की जाँच करने की बात है")
+    ].filter(Boolean);
+    return `आप ${recipient} के साथ आशा दास का रेफ़रल साझा कर रहे हैं। इसमें शामिल है: ${items.join(", ")}। ${draft.printMode === "minimal" ? "कागज़ और क्यूआर में केवल चुना हुआ लैब नतीजा है। बाकी स्वीकृत जानकारी क्लिनिक को साइन इन करने के बाद ऑनलाइन मिलेगी।" : "इस क्यूआर कोड को स्कैन करने वाला व्यक्ति यह जानकारी पढ़ सकता है।"}`;
+  }
+  return `You are sharing Asha Das’s referral with ${clinics[draft.clinic]}. It includes ${details}. ${draft.printMode === "minimal" ? "The paper and QR include only the lab result if selected. Other approved items are available online after the receiving clinic signs in." : "Anyone who scans this QR code can read the included information."}`;
+}
+
+function consentControls() {
+  const hindi = draft.language === "hi";
+  return `<h2>Confirm what you’re sharing</h2>
+    <label class="label" for="language">Consent language</label>
+    <select id="language"><option value="en" ${hindi ? "" : "selected"}>English</option><option value="hi" ${hindi ? "selected" : ""}>हिन्दी</option></select>
+    <div class="readback" lang="${draft.language}">${safe(readback())}</div>
+    <button class="secondary" id="listen">${hindi ? "सुनें" : "Listen to summary"}</button>
+    <form id="consent" lang="${draft.language}">
+      <fieldset><legend>${hindi ? "क्या क्लिनिक आपके अवसाद का इतिहास देख पाएगा?" : "Will the clinic see the history of depression?"}</legend>
+        <label class="answer"><input type="radio" name="answer" value="yes" required> ${hindi ? "हाँ" : "Yes"}</label>
+        <label class="answer"><input type="radio" name="answer" value="no" required> ${hindi ? "नहीं" : "No"}</label>
+      </fieldset>
+      <div class="buttons"><button type="button" class="secondary" id="back">${hindi ? "वापस" : "Back"}</button>
+      <button type="submit" id="issue">${hindi ? "हस्ताक्षरित पास बनाएँ" : "Create signed pass"}</button></div>
+    </form>`;
+}
+
+function shareControls() {
+  return `<h2>Your signed referral</h2>
+    <p>Give this code directly to ${clinics[draft.clinic]}. It expires ${safe(formatDate(issued.pass.expires))}.</p>
+    <img class="pass-qr" src="${safe(issued.qr)}" alt="Signed referral QR code for ${clinics[draft.clinic]}">
+    <div class="buttons">
+      <a class="button" download="doosriparchi.png" href="${safe(issued.qr)}">Save QR image</a>
+      <button class="secondary" id="print">Print pass</button>
+      ${session.user ? '<button class="secondary" id="review-issued">Review sharing</button>' : ""}
+      <button class="secondary" id="new-pass">Start another</button>
+    </div>
+    <details><summary>Show signed pass code</summary>
+      <label class="label" for="issued-token">Copy this code to enter it manually</label>
+      <textarea id="issued-token" readonly rows="3">${safe(issued.token)}</textarea>
+    </details>`;
+}
+
+function renderStep() {
+  byId("patient-step").innerHTML = [previewControls, consentControls, shareControls][step]();
+  document.querySelectorAll(".progress li").forEach((item, index) => {
+    if (index === step) item.setAttribute("aria-current", "step");
+    else item.removeAttribute("aria-current");
+  });
+  if (step === 0) updateConflict();
+  else renderPreview();
+}
+
+function goTo(next) {
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  message("patient-message");
+  step = next;
+  renderStep();
+  const heading = byId("patient-step").querySelector("h2");
+  heading.tabIndex = -1;
+  heading.focus();
+}
+
+byId("patient-step").addEventListener("change", event => {
+  const element = event.target;
+  if (element.id === "recipient") draft.clinic = element.value;
+  if (element.id === "print-mode") draft.printMode = element.value;
+  if (element.type === "checkbox") {
+    draft.fields = Array.from(byId("patient-step").querySelectorAll("input:checked"), input => input.value);
+  }
+  if (element.id === "language") {
+    draft.language = element.value;
+    goTo(1);
+  }
+  if (step === 0) updateConflict();
+});
+
+byId("patient-step").addEventListener("click", event => {
+  switch (event.target.id) {
+    case "clean-note":
+      draft.cleaned = true;
+      updateConflict();
+      byId("continue").focus();
+      break;
+    case "continue": goTo(1); break;
+    case "back": if (!submitting) goTo(0); break;
+    case "listen": speak(); break;
+    case "print": window.print(); break;
+    case "review-issued":
+      openActivity({ id: issued.pass.id, clinic: issued.pass.clinic, expires_at: issued.pass.expires });
+      break;
+    case "new-pass":
+      issued = undefined;
+      draft.fields = [...defaultSelection];
+      draft.cleaned = false;
+      draft.printMode = "full";
+      goTo(0);
+      break;
+  }
+});
+
+function speak() {
+  const unavailable = draft.language === "hi" ? "इस डिवाइस पर हिन्दी आवाज़ उपलब्ध नहीं है। ऊपर दिया गया सारांश पढ़ें।"
+    : "This device could not read the summary aloud. Read the text above.";
+  if (!("speechSynthesis" in window)) return message("patient-message", unavailable);
+  const voice = speechSynthesis.getVoices().find(item => item.localService && item.lang.toLowerCase().startsWith(draft.language));
+  if (!voice) return message("patient-message", unavailable);
+  speechSynthesis.cancel();
+  message("patient-message");
+  const line = new SpeechSynthesisUtterance(readback());
+  line.voice = voice;
+  line.lang = voice.lang;
+  line.onerror = event => {
+    if (event.error !== "canceled" && event.error !== "interrupted") message("patient-message", unavailable);
+  };
+  speechSynthesis.speak(line);
+}
+
+byId("patient-step").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (submitting) return;
+  if (session.enabled && (!session.user || session.user.clinic)) {
+    return message("patient-message", "Sign in with a patient account to create a referral.", true);
+  }
+  const answer = new FormData(event.target).get("answer");
+  const expected = draft.fields.includes("history") ? "yes" : "no";
+  if (answer !== expected) {
+    const prompt = draft.language === "hi" ? "सारांश और रेफ़रल का पूर्वावलोकन पढ़ें, फिर दोबारा जवाब दें।"
+      : "Read the summary and check the referral preview, then answer again.";
+    return message("patient-message", prompt, true);
+  }
+  submitting = true;
+  const button = byId("issue");
+  button.disabled = true;
+  try {
+    issued = await api("issue", { ...draft, answer });
+    goTo(2);
+    refreshActivity();
+  } catch (error) {
+    message("patient-message", error instanceof TypeError ? "Connect to Cedar Health to create a signed pass." : error.message, true);
+  } finally {
+    submitting = false;
+    button.disabled = false;
+  }
+});
+
+const formatDate = date => new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(date));
+
+function decode(encoded) {
+  if (!/^[A-Za-z0-9_-]+$/.test(encoded)) throw new Error("This is not a signed referral.");
+  const binary = atob(encoded.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(binary, char => char.charCodeAt(0));
+}
+
+async function provision() {
+  let key;
+  try {
+    const response = await api("key");
+    key = response.publicKey;
+    localStorage.setItem("referral-issuer-key", key);
+  } catch {
+    key = localStorage.getItem("referral-issuer-key");
+  }
+  if (key) issuerKey = await crypto.subtle.importKey("spki", decode(key), "Ed25519", false, ["verify"]);
+  refreshReadiness();
+}
+
+function refreshReadiness() {
+  byId("offline-ready").textContent = issuerKey
+    ? (offlineShell ? "Ready to scan offline. The issuer key is stored on this device." : "Issuer key loaded. Keep this page open to scan offline.")
+    : "Open this workspace online once to load the issuer key.";
+}
+
+function showVerified(pass) {
+  const accepted = referrals.find(item => item.id === pass.id && item.accepted_at);
+  const queued = session.user?.clinic && outbox().find(item => item.id === pass.id);
+  const online = Boolean(session.user?.clinic && navigator.onLine);
+  const onlineItems = online ? activePass?.onlineItems : undefined;
+  const items = onlineItems ?? pass.items;
+  const note = items.find(item => item.id === "note");
+  const checkedAt = activePass?.checkedAt;
+  const accept = !session.enabled ? "" : accepted
+    ? '<p class="accepted-state">Accepted into clinic intake. The patient can see this receipt.</p>'
+    : queued ? '<p class="accepted-state">' + (queued.failed ? 'Acceptance failed. Review the saved intake below.' : 'Saved on this device. Acceptance will sync when connected.') + '</p>'
+    : '<button id="accept">Accept referral</button>';
+  const restricted = online ? `<button class="secondary" id="load-details">${onlineItems ? "Reload" : "Load"} patient-approved details</button>` : "";
+  const content = `<div class="sheet-head"><span>${safe(pass.issuer)}</span><span>Signed referral</span></div>
+    <h2>Follow-up referral</h2><p><span class="verified-tag">Signature verified</span></p>
+    <dl class="metadata">
+      <div><dt>Patient</dt><dd>${safe(pass.patient)}</dd></div>
+      <div><dt>Prepared for</dt><dd>${safe(clinics[pass.clinic])}</dd></div>
+      <div><dt>Issued</dt><dd>${safe(formatDate(pass.issued))}</dd></div>
+      <div><dt>Expires</dt><dd>${safe(formatDate(pass.expires))}</dd></div>
+    </dl>
+    <p class="sheet-source">${onlineItems ? "Patient-approved online details" : "Details from the signed QR"}</p>
+    <section class="referral-action"><h3>Reason and next action</h3><p>${note ? safe(note.text) : "Follow-up consultation. Review the available referral information with the patient."}</p></section>
+    ${entryMarkup(items.filter(item => item.id !== "note"))}
+    ${accept}
+    <p class="sheet-foot">${checkedAt ? "Issuer confirmed at " + safe(formatDate(checkedAt)) + "." : "Verified on this device. Issuer status has yet to be checked."}</p>
+    <div class="buttons"><button class="secondary" id="check-online">Check with issuer</button>
+    <button class="secondary" id="export">${online ? "Download current FHIR bundle" : "Download printed items only (FHIR)"}</button>${restricted}
+    ${accepted ? '<button class="secondary" id="open-accepted">Open clinic intake</button>' : ""}</div>`;
+  if (activePass.markup === content) return;
+  activePass.markup = content;
+  replacePreservingFocus(byId("verified"), content);
+}
+
+function clearVerified() {
+  activePass = undefined;
+  byId("verified").innerHTML = '<h2>Referral details</h2><p class="muted">A verified referral will appear here.</p>';
+}
+
+async function verifyToken(input) {
+  const attempt = ++verifyAttempt;
+  clearVerified();
+  message("clinic-message");
+  const token = input.trim();
+  try {
+    if (!issuerKey) throw new Error("Load the issuer key online before verifying a pass.");
+    const sections = token.split(".");
+    if (token.length > 3000 || sections.length !== 2) throw new Error("This is not a signed referral.");
+    const bytes = decode(sections[0]);
+    const verified = await crypto.subtle.verify("Ed25519", issuerKey, decode(sections[1]), bytes);
+    if (attempt !== verifyAttempt) return;
+    if (!verified) throw new Error("Signature mismatch. This QR code could have been edited.");
+    const pass = JSON.parse(new TextDecoder().decode(bytes));
+    if (pass.v !== 1 || !Array.isArray(pass.items)) throw new Error("This referral format is unsupported.");
+    if (pass.clinic !== byId("clinic-choice").value) throw new Error("This pass is addressed to " + clinics[pass.clinic] + ".");
+    if (pass.expires <= Date.now()) throw new Error("This referral has expired.");
+    activePass = { pass, token };
+    showVerified(pass);
+  } catch (error) {
+    if (attempt === verifyAttempt) message("clinic-message", error.message, true);
+  }
+}
+
+byId("verify-form").addEventListener("submit", event => {
+  event.preventDefault();
+  verifyToken(byId("pass-code").value);
+});
+byId("clinic-choice").addEventListener("change", () => {
+  verifyAttempt += 1;
+  clearVerified();
+  message("clinic-message");
+});
+byId("verified").addEventListener("click", async event => {
+  if (!activePass) return;
+  const current = activePass;
+  if (current.pass.expires <= Date.now()) {
+    clearVerified();
+    return message("clinic-message", "This referral has expired.", true);
+  }
+  if (event.target.id === "export") {
+    event.target.disabled = true;
+    try {
+      const online = Boolean(session.user?.clinic && navigator.onLine);
+      const { items } = online ? await api("details", { token: current.token, purpose: "export" }) : current.pass;
+      if (current !== activePass) return;
+      downloadFhir({ ...current.pass, items }, "referral");
+      message("clinic-message", online ? "Downloaded current patient-approved items." : "Downloaded the items printed in the signed QR.");
+    } catch (error) {
+      if (current === activePass) message("clinic-message", error instanceof TypeError ? "Connect to download current patient-approved items." : error.message, true);
+    } finally {
+      event.target.disabled = false;
+    }
+  }
+  if (event.target.id === "open-accepted") openActivity(referrals.find(item => item.id === current.pass.id));
+  if (event.target.id === "accept") {
+    try {
+      queueAcceptance(current);
+      showVerified(current.pass);
+      message("clinic-message", "Referral saved on this device. Syncing acceptance…");
+      await refreshActivity();
+    } catch (error) {
+      message("clinic-message", error.message, true);
+    }
+  }
+  if (event.target.id === "load-details") {
+    event.target.disabled = true;
+    try {
+      const { items } = await api("details", { token: current.token, purpose: "view" });
+      if (current === activePass && navigator.onLine) {
+        current.onlineItems = items;
+        showVerified(current.pass);
+        message("clinic-message", "Loaded the items approved by the patient.");
+      }
+    } catch (error) {
+      message("clinic-message", error instanceof TypeError ? "Connect and sign in to the receiving clinic to load these details." : error.message, true);
+    } finally {
+      event.target.disabled = false;
+    }
+  }
+  if (event.target.id === "check-online") {
+    event.target.disabled = true;
+    try {
+      const { checkedAt } = await api("check", { token: current.token, clinic: current.pass.clinic });
+      if (current === activePass) {
+        current.checkedAt = checkedAt;
+        showVerified(current.pass);
+        message("clinic-message");
+      }
+    } catch (error) {
+      if (current === activePass) {
+        message("clinic-message", error instanceof TypeError ? "Connect to the internet to check with the issuer." : error.message, true);
+      }
+    } finally {
+      event.target.disabled = false;
+    }
+  }
+});
+
+const canvas = document.createElement("canvas");
+const context = canvas.getContext("2d", { willReadFrequently: true });
+function readQr(source, width, height) {
+  const scale = Math.min(1, 1500 / Math.max(width, height));
+  canvas.width = Math.round(width * scale);
+  canvas.height = Math.round(height * scale);
+  context.drawImage(source, 0, 0, canvas.width, canvas.height);
+  const frame = context.getImageData(0, 0, canvas.width, canvas.height);
+  return window.jsQR(frame.data, frame.width, frame.height)?.data;
+}
+
+byId("open-image").addEventListener("click", () => byId("image-input").click());
+byId("image-input").addEventListener("change", async event => {
+  const input = event.target;
+  const file = input.files[0];
+  input.value = "";
+  if (!file) return;
+  stopCamera();
+  clearVerified();
+  const attempt = ++verifyAttempt;
+  try {
+    if (file.size > 15_000_000) throw new Error("Choose a QR image under 15 MB.");
+    const bitmap = await createImageBitmap(file);
+    let token;
+    try { token = readQr(bitmap, bitmap.width, bitmap.height); }
+    finally { bitmap.close(); }
+    if (attempt !== verifyAttempt) return;
+    if (!token) throw new Error("No QR code found. Use a clear image of the complete code.");
+    await verifyToken(token);
+  } catch (error) {
+    if (attempt === verifyAttempt) message("clinic-message", error.message, true);
+  }
+});
+
+function stopCamera() {
+  cameraAttempt += 1;
+  cameraStream?.getTracks().forEach(track => track.stop());
+  cameraStream = undefined;
+  byId("video").srcObject = null;
+  byId("video").hidden = true;
+  byId("camera").textContent = "Use camera";
+}
+
+byId("camera").addEventListener("click", async () => {
+  if (cameraStream) return stopCamera();
+  const attempt = ++cameraAttempt;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+    if (attempt !== cameraAttempt) return stream.getTracks().forEach(track => track.stop());
+    cameraStream = stream;
+    const video = byId("video");
+    video.hidden = false;
+    video.srcObject = stream;
+    await video.play();
+    byId("camera").textContent = "Stop camera";
+    const scan = () => {
+      if (attempt !== cameraAttempt) return;
+      const token = video.videoWidth && readQr(video, video.videoWidth, video.videoHeight);
+      if (token) {
+        stopCamera();
+        verifyToken(token);
+      } else setTimeout(scan, 180);
+    };
+    scan();
+  } catch {
+    if (attempt !== cameraAttempt) return;
+    stopCamera();
+    message("clinic-message", "Camera unavailable. Open a saved QR image or enter the pass code.", true);
+  }
+});
+
+function route() {
+  const canView = !session.enabled || session.user;
+  const clinic = session.enabled ? Boolean(session.user?.clinic) : location.hash === "#clinic";
+  byId("clinic").hidden = !canView || !clinic;
+  byId("patient").hidden = !canView || clinic;
+  byId("clinic-link").hidden = session.enabled && !session.user?.clinic;
+  byId("patient-link").hidden = session.enabled && (!session.user || clinic);
+  byId("clinic-link").setAttribute("aria-current", clinic ? "page" : "false");
+  byId("patient-link").setAttribute("aria-current", clinic ? "false" : "page");
+  if (!clinic) stopCamera();
+  if (clinic && "speechSynthesis" in window) speechSynthesis.cancel();
+}
+
+window.addEventListener("hashchange", route);
+renderStep();
+route();
+provision().catch(() => refreshReadiness());
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").then(() => navigator.serviceWorker.ready).then(() => {
+    offlineShell = true;
+    refreshReadiness();
+  }).catch(() => refreshReadiness());
+}
+function renderAccount() {
+  byId("account-panel").hidden = !session.enabled;
+  byId("login-form").hidden = Boolean(session.user);
+  const user = session.user;
+  byId("account-summary").innerHTML = user
+    ? '<div><strong>' + safe(user.clinic ? clinics[user.clinic] : "Patient workspace") +
+      '</strong><p class="muted">' + safe(user.email) + '</p></div><button class="secondary" id="logout">Sign out</button>'
+    : '<p>Sign in to create referrals or accept them into your clinic.</p>';
+  byId("sync-section").hidden = !user;
+  byId("clinic-choice").disabled = Boolean(user?.clinic);
+  if (user?.clinic) byId("clinic-choice").value = user.clinic;
+  if (step === 0) renderStep();
+  route();
+}
+
+function renderActivity() {
+  if (!session.user) return;
+  byId("sync-heading").textContent = session.user.clinic ? "Clinic intake" : "Your referrals";
+  const queue = outbox();
+  const queued = queue.map(item =>
+    `<article class="activity-row"><div><strong>${item.failed ? "Acceptance unavailable" : "Pending acceptance"}</strong><p>${safe(clinics[item.clinic])} · ${safe(item.id)}</p>
+    <small>${safe(item.error || "Saved on this device. Will retry when connected.")}</small></div>${item.failed ? `<button class="secondary" data-discard="${safe(item.id)}">Remove failed intake</button>` : ""}</article>`).join("");
+  if (queued !== outboxMarkup) {
+    outboxMarkup = queued;
+    replacePreservingFocus(byId("outbox-list"), queued);
+  }
+  const list = referrals.length ? referrals.map(item =>
+    `<article class="activity-row"><div><strong>${session.user.clinic ? "Asha Das · Follow-up referral" : safe(clinics[item.clinic])}</strong>
+      <p>Created ${safe(formatDate(item.issued_at))}</p>
+      <small>${item.accepted_at ? "Accepted for intake · " + safe(formatDate(item.accepted_at)) : "Awaiting clinic intake"}</small></div>
+      <button class="secondary" id="activity-${safe(item.id)}" data-review="${safe(item.id)}" aria-pressed="${item.id === selectedReferral?.row.id}">${session.user.clinic ? "Open intake" : "Review sharing"}</button></article>`).join("")
+    : '<p class="muted">No referrals yet.</p>';
+  if (list !== listMarkup) {
+    listMarkup = list;
+    replacePreservingFocus(byId("referral-list"), list);
+  }
+}
+
+function openActivity(row) {
+  if (!row) return;
+  if (selectedReferral?.row.id !== row.id) {
+    selectedReferral = { row };
+    message("detail-message");
+  }
+  renderActivity();
+  renderActivityDetail();
+  byId("activity-detail-heading").focus();
+  refreshReview(selectedReferral);
+}
+
+function closeActivity() {
+  const rowId = selectedReferral?.row.id;
+  selectedReferral = undefined;
+  byId("activity-detail").hidden = true;
+  byId("activity-detail-body").replaceChildren();
+  message("detail-message");
+  renderActivity();
+  if (rowId) (byId("activity-" + rowId) ?? byId("review-issued"))?.focus();
+}
+
+const recordLabels = { result: "Lab result", history: "Medical history", note: "Referral note", "previous-result": "Previous hemoglobin" };
+const eventTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
+
+function timelineMarkup(review, clinic, isClinic) {
+  const titles = {
+    issued: "Signed referral created", intake: clinic + " accepted the referral for intake",
+    view: clinic + " opened online details", export: clinic + " retrieved data for a FHIR export",
+    request: clinic + " requested previous hemoglobin", approve: isClinic ? "Asha approved the request" : "You approved the request",
+    decline: isClinic ? "Asha declined the request" : "You declined the request",
+    withdraw: isClinic ? "Asha withdrew the online referral note" : "You withdrew the online referral note"
+  };
+  return `<section class="activity-timeline"><h3>Referral timeline</h3><ol>${[...review.events].reverse().map(event => {
+    const items = event.itemIds?.map(id => recordLabels[id]).filter(Boolean).join(", ");
+    return `<li><time datetime="${safe(new Date(event.at).toISOString())}">${safe(eventTime.format(new Date(event.at)))}</time>
+      <strong>${safe(titles[event.kind] ?? "Referral updated")}</strong>
+      ${items && ["view", "export"].includes(event.kind) ? `<small>${safe(items)}</small>` : ""}</li>`;
+  }).join("")}</ol></section>`;
+}
+
+function patientLedger(review, clinic, expired, online) {
+  const previouslyShared = new Set(review.sharedIds);
+  const printed = new Set(review.paperIds);
+  const hasOnlineNote = review.items.some(item => item.id === "note") && !printed.has("note");
+  const canWithdraw = hasOnlineNote && !review.withdrawn && !expired;
+  const legacy = review.printMode === "unknown";
+  const paperSummary = legacy ? "This older pass predates print tracking. Its original contents may already be on paper."
+    : printed.size ? "Anyone with the paper or QR can read the items marked below." : "This QR contains no clinical items.";
+  return `<section class="consent-ledger" aria-label="Shared information">
+    <h3>What you shared with ${safe(clinic)}</h3>
+    <p class="muted ledger-help">${paperSummary}</p>
+    ${review.items.filter(item => item.id !== "previous-result").map(item => {
+      const withdrawn = item.id === "note" && review.withdrawn;
+      return `<div class="consent-row"><div><strong>${safe(item.label)}</strong><p>${safe(item.text)}</p></div>
+        <ul class="consent-channels" aria-label="Sharing status">
+          ${printed.has(item.id) ? (legacy ? '<li>Possibly on the original pass</li>' : '<li>On paper and QR</li>') : ""}
+          <li class="${withdrawn ? "withdrawn" : ""}">${withdrawn ? "Online access withdrawn" : expired ? "Online access expired" : "Available online"}</li>
+          ${previouslyShared.has(item.id) ? '<li class="prior-access">Opened or exported online</li>' : ""}
+        </ul></div>`;
+    }).join("")}
+    ${hasOnlineNote ? `<div class="withdraw-note">${canWithdraw ? `<p>Withdrawing the note stops future online access to it. Earlier downloads stay with the clinic.</p>
+      <button class="secondary" id="withdraw-note" data-manage="withdraw" ${online ? "" : "disabled"}>Withdraw online referral note</button>` : review.withdrawn ?
+      (previouslyShared.has("note") ? "<p>The clinic retrieved the note before withdrawal and may already hold a copy.</p>" :
+      "<p>No online retrieval of this note was recorded before withdrawal.</p>") : ""}</div>` : ""}
+  </section>`;
+}
+
+function requestMarkup(review, clinic, isClinic, expired, online) {
+  const record = review.items?.find(item => item.id === "previous-result");
+  const request = review.request;
+  if (!request && !isClinic) return "";
+  const disabled = online ? "" : "disabled";
+  const reason = request ? `<p class="request-reason">${safe(request.reason)}</p>` : "";
+  let content;
+  if (!request) {
+    content = expired ? '<p class="muted">This referral has expired.</p>' : `<form id="request-record">
+      <label class="label" for="request-reason">Why does the clinic need this result?</label>
+      <textarea id="request-reason" name="reason" rows="2" maxlength="240" required ${disabled}></textarea>
+      <button type="submit" ${disabled}>Request previous hemoglobin</button>
+    </form>`;
+  } else if (request.status === "pending") {
+    content = `<p>${expired ? "The referral expired before a decision was recorded." : isClinic ? "Waiting for Asha to decide." : safe(clinic) + " needs this result for the following reason."}</p>
+      ${reason}${record ? `<div class="record-preview"><strong>${safe(record.label)}</strong><p>${safe(record.text)}</p></div>` : ""}
+      ${!isClinic && !expired ? `<p class="muted">If you approve, ${safe(clinic)} can open or download this result online.</p>
+      <div class="buttons"><button id="approve-record" data-manage="approve" ${disabled}>Share this result</button>
+      <button class="secondary" id="decline-record" data-manage="decline" ${disabled}>Decline request</button></div>` : ""}`;
+  } else if (request.status === "approved") {
+    const shared = review.sharedIds.includes("previous-result");
+    content = `<p>${expired ? "Approved before this referral expired." : "Approved for online access."} ${!isClinic ? (shared ? "The clinic opened or exported this result." : "The clinic has yet to open or export this result.") : ""}</p>${reason}`;
+  } else {
+    content = `<p>Request declined.</p>${reason}`;
+  }
+  return `<section class="record-request"><h3>${isClinic ? "Previous hemoglobin" : "Request for previous hemoglobin"}</h3>${content}</section>`;
+}
+
+function clinicLedger(selected, expired, online) {
+  return `<section class="consent-ledger" aria-label="Intake details"><h3>Patient-approved details</h3>
+    ${selected.items ? entryMarkup(selected.items) || '<p class="muted">No clinical details are currently available online.</p>' :
+      '<p class="muted">Open the items Asha currently allows this clinic to see.</p>'}
+    ${!expired ? `<div class="buttons"><button id="view-intake" ${online ? "" : "disabled"}>${selected.items ? "Reload" : "Open"} online details</button>
+      <button class="secondary" id="export-intake" ${online ? "" : "disabled"}>Download current FHIR bundle</button></div>` : '<p class="muted">This referral has expired.</p>'}</section>`;
+}
+
+function renderActivityDetail() {
+  if (!selectedReferral) return;
+  const selected = selectedReferral;
+  const { row, review } = selected;
+  const isClinic = Boolean(session.user?.clinic);
+  const clinic = clinics[row.clinic];
+  const expired = new Date(row.expires_at).getTime() <= Date.now();
+  const online = navigator.onLine;
+  const body = byId("activity-detail-body");
+  const reason = byId("request-reason");
+  const entry = reason?.value;
+  const selection = reason ? [reason.selectionStart, reason.selectionEnd, reason.selectionDirection] : undefined;
+  const content = `<header class="activity-detail-header"><div>
+    <h2 id="activity-detail-heading" tabindex="-1">${isClinic ? "Asha Das’s intake" : `Your referral to ${safe(clinic)}`}</h2>
+    ${!isClinic && row.accepted_at ? '<p>Intake confirms the clinic received your referral. Contact the clinic to schedule a visit.</p>' : ""}
+    </div><button class="secondary" id="close-detail">Close details</button></header>
+    ${!online ? '<p class="detail-offline">Reconnect to check current access or make changes.</p>' : ""}
+    ${review ? `<div class="activity-columns"><div class="activity-record">
+      ${requestMarkup(review, clinic, isClinic, expired, online)}
+      ${isClinic ? clinicLedger(selected, expired, online) : patientLedger(review, clinic, expired, online)}
+    </div>${timelineMarkup(review, clinic, isClinic)}</div>` :
+      online ? "<p class=\"muted\">Load sharing and activity for this referral.</p>" : ""}`;
+  byId("activity-detail").hidden = false;
+  if (selected.markup === content) return;
+  selected.markup = content;
+  replacePreservingFocus(body, content);
+  const nextReason = byId("request-reason");
+  if (nextReason && selection) {
+    nextReason.value = entry;
+    nextReason.setSelectionRange(...selection);
+  }
+}
+
+function setReview(selected, review) {
+  if (review.withdrawn && !selected.review?.withdrawn) {
+    if (selected.items) selected.items = selected.items.filter(item => item.id !== "note");
+    if (activePass?.pass.id === selected.row.id && activePass.onlineItems) {
+      activePass.onlineItems = activePass.onlineItems.filter(item => item.id !== "note");
+      showVerified(activePass.pass);
+    }
+  }
+  selected.review = review;
+  renderActivityDetail();
+}
+
+async function refreshReview(selected) {
+  if (!selected || selected !== selectedReferral || selected.reading || selected.saving || !navigator.onLine) return;
+  selected.reading = true;
+  const revision = selected.revision;
+  try {
+    const { review } = await api("manage", { id: selected.row.id, action: "review" });
+    if (selected === selectedReferral && revision === selected.revision) setReview(selected, review);
+  } catch (error) {
+    if (selected === selectedReferral && revision === selected.revision) {
+      message("detail-message", error instanceof TypeError ? "Reconnect to load this referral’s activity." : error.message, true);
+    }
+  } finally {
+    selected.reading = false;
+  }
+}
+
+async function refreshActivity() {
+  if (!session.enabled || !session.user || syncBusy) return;
+  syncBusy = true;
+  const account = session.user.id;
+  try {
+    renderActivity();
+    if (!navigator.onLine) {
+      message("sync-message", "Offline. Saved intake will retry when this device reconnects.");
+      return;
+    }
+    await flushOutbox();
+    if (session.user?.id !== account) return;
+    const result = await api("referrals");
+    if (session.user?.id !== account) return;
+    referrals = result.referrals;
+    if (selectedReferral) {
+      const row = referrals.find(item => item.id === selectedReferral.row.id);
+      if (row) selectedReferral.row = row;
+      await refreshReview(selectedReferral);
+    }
+    renderActivity();
+    if (activePass) showVerified(activePass.pass);
+    message("sync-message", "Up to date.");
+    if (activePass && referrals.some(item => item.id === activePass.pass.id && item.accepted_at)) {
+      message("clinic-message", "Referral accepted. The patient can see the receipt.");
+    }
+  } catch (error) {
+    message("sync-message", error instanceof TypeError ? "Connection unavailable. Saved intake will retry." : error.message, true);
+    if ([401, 403].includes(error.status)) {
+      try { await loadSession(); } catch { message("account-message", "Reconnect to check your sign-in.", true); }
+    }
+  } finally {
+    syncBusy = false;
+    renderActivity();
+  }
+}
+
+byId("login-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const form = event.target;
+  const button = form.querySelector("button");
+  button.disabled = true;
+  message("account-message");
+  try {
+    const data = new FormData(form);
+    await login({ email: data.get("email"), password: data.get("password") });
+    form.reset();
+    location.hash = session.user?.clinic ? "#clinic" : "#patient";
+    await refreshActivity();
+  } catch (error) {
+    message("account-message", error instanceof TypeError ? "Connect to sign in." : error.message, true);
+  } finally { button.disabled = false; }
+});
+
+byId("account-summary").addEventListener("click", async event => {
+  if (event.target.id !== "logout") return;
+  event.target.disabled = true;
+  try {
+    await logout();
+    clearVerified();
+    issued = undefined;
+    referrals = [];
+    step = 0;
+    draft.printMode = "full";
+    renderStep();
+    message("account-message");
+  } catch (error) {
+    message("account-message", error.message, true);
+  } finally { event.target.disabled = false; }
+});
+
+byId("referral-list").addEventListener("click", event => {
+  const button = event.target.closest("[data-review]");
+  if (button) openActivity(referrals.find(row => row.id === button.dataset.review));
+});
+
+async function detailAction(selected, operation) {
+  if (!selected || selected.saving || !navigator.onLine) return;
+  selected.saving = true;
+  selected.revision = (selected.revision ?? 0) + 1;
+  message("detail-message");
+  try {
+    await operation();
+  } catch (error) {
+    if (selected === selectedReferral) message("detail-message", error instanceof TypeError ? "Reconnect and try again." : error.message, true);
+  } finally {
+    selected.saving = false;
+  }
+}
+
+async function changeSharing(action, reason) {
+  const selected = selectedReferral;
+  await detailAction(selected, async () => {
+    const { review } = await api("manage", { id: selected.row.id, action, reason });
+    if (selected === selectedReferral) setReview(selected, review);
+  });
+}
+
+byId("activity-detail").addEventListener("click", async event => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  if (button.id === "close-detail") return closeActivity();
+  if (button.dataset.manage) return changeSharing(button.dataset.manage);
+  if (!["view-intake", "export-intake"].includes(button.id)) return;
+  const selected = selectedReferral;
+  await detailAction(selected, async () => {
+    const purpose = button.id === "view-intake" ? "view" : "export";
+    const { items } = await api("details", { id: selected.row.id, purpose });
+    if (selected !== selectedReferral || !navigator.onLine) return;
+    if (purpose === "view") {
+      selected.items = items;
+      renderActivityDetail();
+    } else {
+      downloadFhir({ id: selected.row.id, issued: Date.parse(selected.row.issued_at), items }, "intake");
+    }
+  });
+  await refreshReview(selected);
+});
+
+byId("activity-detail").addEventListener("submit", event => {
+  if (event.target.id !== "request-record") return;
+  event.preventDefault();
+  changeSharing("request", new FormData(event.target).get("reason").trim());
+});
+
+byId("outbox-list").addEventListener("click", event => {
+  const button = event.target.closest("[data-discard]");
+  if (!button) return;
+  try {
+    discardQueued(button.dataset.discard);
+    if (activePass) showVerified(activePass.pass);
+  } catch (error) { message("sync-message", error.message, true); }
+});
+byId("retry-sync").addEventListener("click", refreshActivity);
+window.addEventListener("referral-account", () => {
+  if (activeAccountId !== session.user?.id) {
+    referrals = [];
+    if (selectedReferral) closeActivity();
+    clearVerified();
+    issued = undefined;
+    step = 0;
+    draft.printMode = "full";
+  }
+  activeAccountId = session.user?.id;
+  renderAccount();
+});
+window.addEventListener("referral-outbox", renderActivity);
+window.addEventListener("online", async () => {
+  try {
+    await loadSession();
+    await refreshActivity();
+  } catch (error) { message("account-message", error.message, true); }
+});
+window.addEventListener("offline", () => {
+  if (activePass) {
+    delete activePass.onlineItems;
+    showVerified(activePass.pass);
+  }
+  if (selectedReferral) {
+    delete selectedReferral.items;
+    renderActivityDetail();
+  }
+  message("sync-message", "Offline. Accepted referrals remain saved on this device until sync.");
+});
+setInterval(() => {
+  if (!document.hidden) refreshActivity();
+}, 8000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshActivity(); });
+loadSession().then(() => {
+  renderAccount();
+  if (session.user?.clinic) location.hash = "#clinic";
+  return refreshActivity();
+}).catch(error => {
+  byId("account-panel").hidden = false;
+  message("account-message", "Account connection unavailable. " + error.message, true);
+});

@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#252238">
+  <title>DoosriParchi</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/jsqr.js" defer></script>
+  <script type="module" src="/app.mjs"></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="mast-inner">
+      <a class="brand" href="#patient"><span class="mark" aria-hidden="true"></span>DoosriParchi</a>
+      <nav aria-label="Workspace">
+        <a href="#patient" id="patient-link">Patient</a>
+        <a href="#clinic" id="clinic-link">Receiving clinic</a>
+      </nav>
+      <span class="demo">Synthetic case</span>
+    </div>
+  </header>
+  <main id="main">
+    <section class="account-panel" id="account-panel" hidden aria-label="Account">
+      <div id="account-summary"></div>
+      <form id="login-form" hidden>
+        <label>Email<input type="email" name="email" autocomplete="username" required maxlength="254"></label>
+        <label>Password<input type="password" name="password" autocomplete="current-password" required maxlength="256"></label>
+        <button type="submit">Sign in</button>
+      </form>
+      <p id="account-message" class="message" role="status"></p>
+    </section>
+    <section id="patient">
+      <div class="intro patient-intro">
+        <h1>Send a referral</h1>
+        <ol class="progress" aria-label="Referral progress">
+          <li aria-current="step">Preview</li><li>Consent</li><li>Share</li>
+        </ol>
+      </div>
+      <div class="layout">
+        <div class="editor">
+          <section id="patient-step" class="controls"></section>
+          <p id="patient-message" class="message" role="status"></p>
+        </div>
+        <aside class="document-tray" aria-label="Exact outgoing referral">
+          <div class="sheet">
+            <div class="sheet-head"><span>Cedar Health</span><span id="sheet-status">Draft</span></div>
+            <h2>Follow-up referral</h2>
+            <dl class="metadata">
+              <div><dt>Patient</dt><dd>Asha Das</dd></div>
+              <div><dt>Prepared for</dt><dd id="preview-clinic">North Clinic</dd></div>
+            </dl>
+            <div id="preview-items"></div>
+            <div id="online-preview"></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+    <section id="clinic" hidden>
+      <div class="intro">
+        <h1>Verify a referral</h1>
+        <p>Scan the patient’s QR code or open a saved QR image.</p>
+      </div>
+      <div class="layout clinic-layout">
+        <section class="controls" aria-label="Referral scanner">
+          <label class="label" for="clinic-choice">Receiving clinic</label>
+          <select id="clinic-choice"><option value="north">North Clinic</option><option value="south">South Clinic</option></select>
+          <p id="offline-ready" class="muted" role="status">Preparing offline verification…</p>
+          <div class="buttons">
+            <button type="button" id="camera">Use camera</button>
+            <button type="button" class="secondary" id="open-image">Open QR image</button>
+            <input type="file" id="image-input" accept="image/*" hidden>
+          </div>
+          <video id="video" playsinline muted hidden aria-label="QR scanning camera"></video>
+          <details>
+            <summary>Enter a pass code</summary>
+            <form id="verify-form">
+              <label class="label" for="pass-code">Signed pass code</label>
+              <textarea id="pass-code" rows="3" maxlength="3000" required></textarea>
+              <button type="submit">Verify pass</button>
+            </form>
+          </details>
+          <p id="clinic-message" class="message" role="status"></p>
+        </section>
+        <div class="document-tray">
+          <section class="sheet" id="verified" aria-live="polite"><h2>Referral details</h2><p class="muted">A verified referral will appear here.</p></section>
+        </div>
+      </div>
+    </section>
+    <section id="sync-section" class="sync-section" hidden aria-label="Referral activity">
+      <div class="sync-heading"><h2 id="sync-heading">Referral activity</h2><button class="secondary" id="retry-sync">Refresh and retry</button></div>
+      <p id="sync-message" class="message" role="status"></p>
+      <div id="outbox-list"></div>
+      <div id="referral-list"></div>
+      <section id="activity-detail" class="activity-detail" aria-labelledby="activity-detail-heading" hidden>
+        <div id="activity-detail-body"></div>
+        <p id="detail-message" class="message" role="status"></p>
+      </section>
+    </section>
+  </main>
+</body>
+</html>

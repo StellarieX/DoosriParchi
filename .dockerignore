@@ -1,0 +1,9 @@
+.git
+node_modules
+.env*
+*.pem
+*.key
+coverage
+npm-debug.log*
+dist
+.vercel
