@@ -5,6 +5,7 @@ import { createInterface } from "node:readline";
 import { after, before, test } from "node:test";
 import { disclosure, toFhir } from "../public/case.mjs";
 import { verifyExportReceipt } from "../public/export-receipt.mjs";
+import { readReferralDocument } from "../public/fhir-import.mjs";
 import { startMockSupabase, mockPublishableKey, mockSecretKey } from "./fixtures/supabase.mjs";
 
 let server;
@@ -50,9 +51,9 @@ after(async () => {
 });
 
 function device() {
-  let cookie = "";
+  const cookies = new Map();
   async function request(path, body) {
-    const headers = { Cookie: cookie };
+    const headers = { Cookie: Array.from(cookies, ([name, value]) => name + "=" + value).join("; ") };
     const options = { headers };
     if (body) {
       options.method = "POST";
@@ -61,8 +62,11 @@ function device() {
       options.body = JSON.stringify(body);
     }
     const response = await fetch(base + path, options);
-    const setCookie = response.headers.get("set-cookie");
-    if (setCookie) cookie = setCookie.split(";")[0];
+    for (const setCookie of response.headers.getSetCookie()) {
+      const [name, value] = setCookie.split(";", 1)[0].split("=");
+      if (value) cookies.set(name, value);
+      else cookies.delete(name);
+    }
     return response;
   }
   async function read(path, body) {
@@ -77,8 +81,38 @@ function device() {
   const manage = (id, action, reason) => read("/api/manage", { id, action, reason }).then(result => result.review);
   const details = (reference, purpose = "view") =>
     read("/api/details", { ...reference, purpose }).then(result => result.items);
-  return { request, read, login, manage, details };
+  return { request, read, login, manage, details, cookies };
 }
+
+test("clinical sessions renew from an HttpOnly refresh cookie and sign-out clears the renewed session", async () => {
+  const clinic = device();
+  const login = await clinic.request("/api/login", { email: "north@example.test", password: "demo-password" });
+  assert.equal(login.status, 200);
+  assert.ok(login.headers.getSetCookie().every(cookie => cookie.includes("HttpOnly") && cookie.includes("SameSite=Strict")));
+  const before = clinic.cookies.get("referral_refresh");
+  clinic.cookies.delete("referral_access");
+  assert.equal((await clinic.read("/api/session")).user.clinic, "north");
+  const refreshed = clinic.cookies.get("referral_refresh");
+  assert.ok(refreshed && refreshed !== before);
+  assert.deepEqual(await clinic.read("/api/logout", {}), { enabled: true, user: null });
+  assert.equal(clinic.cookies.size, 0);
+  clinic.cookies.set("referral_refresh", refreshed);
+  assert.equal((await clinic.read("/api/session")).user, null);
+});
+
+test("offline intake proof authenticates only referral metadata and requires the receiving clinic", async () => {
+  const [patient, north, south] = Array.from({ length: 3 }, () => device());
+  await Promise.all([patient.login("patient@example.test"), north.login("north@example.test"), south.login("south@example.test")]);
+  const { pass } = await patient.read("/api/issue", { ...draft, printMode: "minimal" });
+  const proof = JSON.parse(Buffer.from(pass.intakeProof.split(".")[0], "base64url"));
+  assert.deepEqual(Object.keys(proof), ["v", "kind", "kid", "id", "clinic", "expires"]);
+  assert.equal(proof.id, pass.id);
+  assert.equal((await south.request("/api/accept", { token: pass.intakeProof, includeDetails: false })).status, 403);
+  const result = await north.read("/api/accept", { token: pass.intakeProof, includeDetails: false });
+  assert.equal(result.receipt.id, pass.id);
+  assert.equal(result.items, undefined);
+  assert.equal((await north.request("/api/details", { token: pass.intakeProof })).status, 422);
+});
 
 test("the server authenticates roles before issuing, reading, or accepting referrals", async () => {
   const anonymous = device();
@@ -115,7 +149,9 @@ test("a receipt reaches another patient device and repeated clinic acceptance is
   const accepted = await north.read("/api/accept", { token });
   assert.equal(accepted.receipt.id, pass.id);
   assert.ok(Number.isFinite(Date.parse(accepted.receipt.accepted_at)));
-  assert.deepEqual(await north.read("/api/accept", { token }), accepted);
+  assert.deepEqual(Object.keys(accepted), ["receipt"]);
+  assert.deepEqual(await north.read("/api/accept", { token, includeDetails: false }), accepted);
+  assert.deepEqual((await laptop.manage(pass.id, "review")).events.map(event => event.kind), ["issued", "intake"]);
   const received = (await laptop.read("/api/referrals")).referrals.find(row => row.id === pass.id);
   assert.equal(received.accepted_at, accepted.receipt.accepted_at);
   const inbox = (await north.read("/api/referrals")).referrals.find(row => row.id === pass.id);
@@ -177,13 +213,24 @@ test("the default signed-in QR exposes a reference while only the receiving clin
   const payload = JSON.parse(Buffer.from(token.split(".")[0], "base64url"));
   assert.equal(payload.printMode, "private");
   assert.deepEqual(payload.items, []);
-  assert.deepEqual(Object.keys(payload), ["v", "id", "issuer", "clinic", "issued", "expires", "printMode", "items"]);
+  assert.deepEqual(Object.keys(payload), ["v", "kid", "id", "issuer", "clinic", "issued", "expires", "printMode", "items"]);
   assert.deepEqual(database.rows.get(pass.id).paper_ids, []);
   assert.equal((await visitor.request("/api/details", { token })).status, 401);
   assert.equal((await south.request("/api/details", { token })).status, 403);
   assert.equal((await patient.request("/api/details", { token })).status, 403);
-  assert.equal((await north.request("/api/details", { id: pass.id })).status, 409);
+  for (const purpose of ["view", "export"]) {
+    assert.equal((await north.request("/api/details", { token, purpose })).status, 409);
+    assert.equal((await north.request("/api/details", { id: pass.id, purpose })).status, 409);
+  }
+  assert.deepEqual((await patient.manage(pass.id, "review")).events.map(event => event.kind), ["issued"]);
+  assert.equal((await south.request("/api/accept", { token })).status, 403);
+  const accepted = await north.read("/api/accept", { token, includeDetails: true });
+  assert.equal(accepted.receipt.id, pass.id);
+  assert.deepEqual(accepted.items, disclosure(draft.fields, draft.cleaned));
+  assert.equal(accepted.patient, "Asha Das");
+  assert.deepEqual((await patient.manage(pass.id, "review")).events.map(event => event.kind), ["issued", "intake", "view"]);
   assert.deepEqual(await north.read("/api/details", { token }), { items: disclosure(draft.fields, draft.cleaned), patient: "Asha Das" });
+  assert.equal((await north.request("/api/details", { token, purpose: "export" })).status, 200);
   await patient.manage(pass.id, "withdraw");
   assert.deepEqual(await north.details({ token }), disclosure(["result"], true));
   assert.deepEqual(await patient.read("/api/recover", { id: pass.id }), { pass, token, qr });
@@ -195,6 +242,12 @@ test("signed export receipts bind exact FHIR bytes and follow the patient’s di
   const { pass: { id }, token } = await patient.read("/api/issue", { ...draft, printMode: "private" });
   const { publicKey } = await device().read("/api/key");
   assert.equal((await clinic.request("/api/details", { id, purpose: "export" })).status, 409);
+  await clinic.read("/api/accept", { token, includeDetails: false });
+  const startsAt = new Date(Date.now() + 86400000).toISOString();
+  const { appointment } = await clinic.read("/api/appointment", {
+    id, action: "propose", startsAt, instructions: "Bring the original lab slip."
+  });
+  await patient.read("/api/appointment", { id, action: "confirm", proposalId: appointment.id });
   const first = await clinic.read("/api/details", { token, purpose: "export" });
   const verify = (exported, bundle = exported.bundle) => verifyExportReceipt(exported.receipt, Buffer.from(bundle), publicKey);
   const original = await verify(first);
@@ -202,6 +255,11 @@ test("signed export receipts bind exact FHIR bytes and follow the patient’s di
   assert.equal(original.receipt.clinic, "north");
   assert.equal(original.receipt.referralId, id);
   assert.match(first.bundle, /Please review the hemoglobin result/);
+  assert.doesNotMatch(first.bundle, /Bring the original lab slip/);
+  const firstImport = readReferralDocument(Buffer.from(first.bundle), original.receipt);
+  assert.deepEqual(firstImport.labs.map(lab => lab.value), [12.8]);
+  assert.equal(firstImport.appointmentStart, startsAt);
+  assert.equal(firstImport.noteIncluded, true);
   assert.equal((await verify(first, first.bundle.replace('"status": "active"', '"status": "revoked"'))).matches, false);
   const [payload, signature] = first.receipt.split(".");
   const changedPayload = Buffer.from(JSON.stringify({ ...original.receipt, clinic: "south" })).toString("base64url");
@@ -211,10 +269,11 @@ test("signed export receipts bind exact FHIR bytes and follow the patient’s di
   assert.equal((await other.request("/api/manage", { id, action: "review" })).status, 404);
 
   await patient.manage(id, "withdraw");
-  await clinic.read("/api/accept", { token });
   const second = await clinic.read("/api/details", { id, purpose: "export" });
   assert.doesNotMatch(second.bundle, /Please review the hemoglobin result/);
-  assert.equal((await verify(second)).matches, true);
+  const updated = await verify(second);
+  assert.equal(updated.matches, true);
+  assert.equal(readReferralDocument(Buffer.from(second.bundle), updated.receipt).noteIncluded, false);
   assert.equal((await verify(first, second.bundle)).matches, false);
   assert.equal((await verify(first)).matches, true);
   const review = await patient.manage(id, "review");
@@ -287,6 +346,7 @@ test("a minimal QR contains only the approved result while its clinic retrieves 
   const payload = JSON.parse(Buffer.from(token.split(".")[0], "base64url"));
   assert.doesNotMatch(JSON.stringify(payload), /depression|Please review/);
   assert.deepEqual(payload.items, disclosure(["result"], false));
+  await north.read("/api/accept", { token, includeDetails: false });
   const details = await north.details({ token });
   assert.deepEqual(details, disclosure(selected, false));
   assert.deepEqual(database.rows.get(pass.id).items, details);
@@ -302,6 +362,7 @@ test("a minimal QR contains only the approved result while its clinic retrieves 
   const minimal = JSON.parse(Buffer.from(noResult.token.split(".")[0], "base64url"));
   assert.deepEqual(minimal.items, []);
   assert.doesNotMatch(JSON.stringify(minimal), /depression/);
+  await north.read("/api/accept", { token: noResult.token, includeDetails: false });
   assert.deepEqual(await north.details({ token: noResult.token }), disclosure(["history"], false));
 });
 
@@ -320,7 +381,8 @@ test("withdrawal changes future signed and inbox access while preserving intake 
   assert.deepEqual(before.paperIds, ["result"]);
   assert.deepEqual(before.sharedIds, []);
   assert.deepEqual(before.events.map(event => event.kind), ["issued"]);
-  const initialItems = await north.details({ token });
+  const { receipt, items: initialItems } = await north.read("/api/accept", { token, includeDetails: true });
+  assert.equal(receipt.id, id);
   assert.deepEqual(initialItems, disclosure(draft.fields, true));
   assert.match(JSON.stringify(toFhir({ ...pass, items: initialItems })), /Please review/);
 
@@ -329,8 +391,6 @@ test("withdrawal changes future signed and inbox access while preserving intake 
   assert.deepEqual(withdrawn.sharedIds.slice().sort(), ["note", "result"]);
   assert.equal((await patient.manage(id, "withdraw")).events.filter(event => event.kind === "withdraw").length, 1);
 
-  const { receipt } = await north.read("/api/accept", { token });
-  assert.equal(receipt.id, id);
   for (const reference of [{ token }, { id }]) {
     assert.deepEqual(await north.details(reference), disclosure(["result"], true));
     const items = await north.details(reference, "export");
@@ -341,8 +401,8 @@ test("withdrawal changes future signed and inbox access while preserving intake 
   }
   const reviewed = await patient.manage(id, "review");
   assert.deepEqual(reviewed.events.map(({ kind, itemIds }) => [kind, itemIds]), [
-    ["issued", ["result"]], ["view", ["result", "note"]], ["withdraw", ["note"]],
-    ["intake", ["result"]], ["view", ["result"]], ["export", ["result"]],
+    ["issued", ["result"]], ["intake", ["result"]], ["view", ["result", "note"]], ["withdraw", ["note"]],
+    ["view", ["result"]], ["export", ["result"]],
     ["view", ["result"]], ["export", ["result"]]
   ]);
   assert.deepEqual(reviewed.sharedIds.slice().sort(), ["note", "result"]);
@@ -355,7 +415,7 @@ test("only completed detail access records a known disclosure and paper notes re
   await north.login("north@example.test");
   const { pass, token } = await patient.read("/api/issue", draft);
   const { id } = pass;
-  await north.read("/api/accept", { token });
+  await north.read("/api/accept", { token, includeDetails: false });
   assert.equal((await patient.request("/api/manage", { id, action: "withdraw" })).status, 409);
   const review = await patient.manage(id, "review");
   assert.deepEqual(review.paperIds, ["result", "note"]);
@@ -437,7 +497,7 @@ test("consent actions and detail authorizations enforce roles, ownership, and ex
   await north.login("north@example.test");
   await south.login("south@example.test");
   const { pass: { id }, token } = await patient.read("/api/issue", { ...draft, printMode: "minimal" });
-  await north.read("/api/accept", { token });
+  await north.read("/api/accept", { token, includeDetails: false });
   for (const action of ["review", "withdraw", "approve", "decline"]) {
     assert.equal((await otherPatient.request("/api/manage", { id, action })).status, 404);
   }
@@ -461,4 +521,71 @@ test("consent actions and detail authorizations enforce roles, ownership, and ex
   assert.equal((await north.request("/api/manage", { id, action: "request", reason: "compare" })).status, 410);
   assert.equal((await patient.request("/api/manage", { id, action: "withdraw" })).status, 410);
   assert.deepEqual((await patient.manage(id, "review")).events.map(event => event.kind), ["issued", "intake"]);
+});
+
+test("online-only withdrawal removes dependent history from the note and can remove a previously approved result", async () => {
+  const patient = device();
+  const north = device();
+  await patient.login("patient@example.test");
+  await north.login("north@example.test");
+  const fields = ["result", "history", "note"];
+  const { pass: { id }, token } = await patient.read("/api/issue", {
+    ...draft, fields, cleaned: false, printMode: "private", answer: "yes"
+  });
+  await north.read("/api/accept", { token, includeDetails: false });
+  const before = await north.read("/api/details", { id, purpose: "export" });
+  assert.match(JSON.stringify(before.bundle), /History of depression/);
+  await north.manage(id, "request", "Compare previous hemoglobin");
+  await patient.manage(id, "approve");
+
+  const withdraw = (itemId) => patient.read("/api/manage", { id, action: "withdraw", itemId }).then(result => result.review);
+  assert.deepEqual((await withdraw("history")).withdrawnIds, ["history"]);
+  assert.equal((await withdraw("history")).events.filter(event => event.kind === "withdraw").length, 1);
+  const current = await north.read("/api/details", { token, purpose: "export" });
+  assert.deepEqual(current.items.map(item => item.id), ["result", "note", "previous-result"]);
+  assert.equal(current.items.find(item => item.id === "note").text, disclosure(["note"], true)[0].text);
+  assert.doesNotMatch(JSON.stringify(current.bundle), /History of depression/);
+  assert.deepEqual((await withdraw("previous-result")).withdrawnIds, ["history", "previous-result"]);
+  assert.deepEqual((await withdraw("result")).withdrawnIds, ["history", "previous-result", "result"]);
+  assert.deepEqual(await north.details({ id }), disclosure(["note"], true));
+  assert.equal((await patient.request("/api/manage", { id, action: "withdraw", itemId: "arbitrary" })).status, 400);
+});
+
+test("accepted referral receipts survive revocation and expiry while future details are blocked", async () => {
+  const patient = device();
+  const north = device();
+  const south = device();
+  await patient.login("patient@example.test");
+  await north.login("north@example.test");
+  await south.login("south@example.test");
+
+  for (const accessStatus of ["revoked", "expired"]) {
+    const { pass: { id }, token } = await patient.read("/api/issue", { ...draft, printMode: "private" });
+    await north.read("/api/accept", { token, includeDetails: false });
+    const { receipt } = await north.read("/api/details", { id, purpose: "export" });
+    await north.manage(id, "request", "Compare previous hemoglobin");
+    if (accessStatus === "revoked") {
+      const revoked = await patient.manage(id, "revoke");
+      assert.equal(revoked.accessStatus, "revoked");
+      assert.deepEqual(await patient.manage(id, "revoke"), revoked);
+      assert.equal((await north.request("/api/accept", { token })).status, 410);
+    } else {
+      database.rows.get(id).expires_at = new Date(Date.now() - 1000).toISOString();
+    }
+    for (const purpose of ["view", "export"]) {
+      assert.equal((await north.request("/api/details", { id, purpose })).status, 410);
+    }
+    const review = await north.manage(id, "review");
+    assert.equal(review.accessStatus, accessStatus);
+    assert.equal(review.items, undefined);
+    assert.equal(review.request, null);
+    assert.equal(review.events.find(event => event.kind === "export").receipt, receipt);
+    assert.equal((await south.request("/api/manage", { id, action: "review" })).status, 404);
+  }
+
+  const { pass: { id }, token } = await patient.read("/api/issue", { ...draft, printMode: "minimal" });
+  const review = await patient.manage(id, "revoke");
+  assert.deepEqual(review.paperIds, ["result"]);
+  assert.equal((await north.request("/api/accept", { token })).status, 410);
+  assert.equal((await north.request("/api/manage", { id, action: "review" })).status, 409);
 });

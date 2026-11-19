@@ -1,4 +1,5 @@
 export const exportReceiptDomain = "DoosriParchi FHIR export receipt v1\n";
+const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 
 export function receiptDocument(token) {
   return JSON.stringify({ receipt: token }, null, 2) + "\n";
@@ -23,6 +24,8 @@ export async function verifyExportReceipt(token, bundleBytes, publicKey) {
   }
   const receipt = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload));
   if (receipt.v !== 1 || receipt.kind !== "fhir-export" || !/^[a-f0-9]{64}$/.test(receipt.sha256) ||
+      typeof receipt.receiptId !== "string" || !uuid.test(receipt.receiptId) ||
+      typeof receipt.referralId !== "string" || !uuid.test(receipt.referralId) ||
       typeof receipt.clinic !== "string" || !Number.isFinite(Date.parse(receipt.exportedAt))) {
     throw new Error("This receipt format is unsupported.");
   }

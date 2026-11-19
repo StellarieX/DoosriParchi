@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#12352f">
+  <title>Sample referral · DoosriParchi</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/demo.mjs"></script>
+</head>
+<body>
+  <header class="masthead"><div class="mast-inner">
+    <a class="brand" href="/"><span class="mark" aria-hidden="true"></span>DoosriParchi</a>
+    <nav aria-label="Workspace">
+      <a href="/demo.html" aria-current="page">Sample referral</a>
+      <a href="/">Sign in</a>
+      <a href="/verify.html">Verify export</a>
+    </nav>
+    <span class="demo">Synthetic case</span>
+  </div></header>
+  <main>
+    <header class="intro">
+      <h1>Follow a referral</h1>
+      <p>Try both sides of a North Clinic referral. This rehearsal uses a synthetic record and keeps your progress in this tab.</p>
+    </header>
+    <div class="layout demo-case">
+      <div class="controls" id="demo-steps">
+        <section id="demo-prepare">
+          <h2>Choose what to share</h2>
+          <div class="warning"><p>Medical history is excluded. The note still says <mark>History of depression</mark>.</p></div>
+          <div class="buttons">
+            <button id="demo-clean">Use a note without medical history</button>
+            <button id="demo-review" disabled>Review consent</button>
+          </div>
+          <p><a href="/demo.html#exports" id="demo-samples">Go to signed sample exports</a></p>
+        </section>
+        <section id="demo-consent" hidden>
+          <h2>Confirm your sharing choice</h2>
+          <form id="demo-confirm">
+            <fieldset><legend>Will North Clinic see the history of depression?</legend>
+              <label class="answer"><input type="radio" name="answer" value="yes" required> Yes</label>
+              <label class="answer"><input type="radio" name="answer" value="no" required> No</label>
+            </fieldset>
+            <button type="submit">Share sample referral</button>
+          </form>
+        </section>
+        <section id="demo-clinic" hidden>
+          <h2>North Clinic intake</h2>
+          <p>Accept the sample to open the approved lab result and referral note.</p>
+          <button id="demo-accept">Accept referral</button>
+        </section>
+        <section id="demo-exports" hidden>
+          <h2>Check the export receipts</h2>
+          <p>Verify the first export. Then withdraw the note to compare what the next export contains.</p>
+          <div class="buttons">
+            <button id="demo-verify-before">Verify first export</button>
+            <button class="secondary" id="demo-withdraw">Withdraw online note</button>
+          </div>
+          <div class="buttons" id="demo-after" hidden>
+            <button id="demo-verify-after">Verify updated export</button>
+            <button class="secondary" id="demo-compare">Try the earlier receipt</button>
+          </div>
+          <details><summary>Download sample files</summary>
+            <ul class="sample-files">
+              <li><a id="sample-before-bundle" download="sample-before.fhir.json">First FHIR export</a> · <a id="sample-before-receipt" download="sample-before.receipt.json">First signed receipt</a></li>
+              <li><a id="sample-after-bundle" download="sample-after.fhir.json">Updated FHIR export</a> · <a id="sample-after-receipt" download="sample-after.receipt.json">Updated signed receipt</a></li>
+            </ul>
+            <a class="button secondary" href="/verify.html">Verify and import downloaded files</a>
+          </details>
+        </section>
+        <p id="demo-message" class="message" role="status"></p>
+      </div>
+      <aside class="document-tray" aria-label="Sample referral">
+        <div class="sheet sample-sheet">
+          <div class="sheet-head"><span>Cedar Health</span><span id="demo-state">Draft</span></div>
+          <h2>Follow-up referral</h2>
+          <dl class="metadata"><div><dt>Prepared for</dt><dd>North Clinic</dd></div>
+            <div id="demo-ref" hidden><dt>Referral</dt><dd id="demo-reference"></dd></div></dl>
+          <div class="entry"><h3>Lab result</h3><p>Hemoglobin · 12.8 g/dL</p></div>
+          <div class="entry" id="demo-note"><h3>Referral note</h3><p>Please review the hemoglobin result at the next visit. <mark id="demo-leak">History of depression</mark><span id="demo-leak-tail"> is documented in the referring chart.</span></p></div>
+          <p class="muted" id="demo-copy" hidden>Earlier signed exports remain available for verification.</p>
+        </div>
+      </aside>
+    </div>
+  </main>
+</body>
+</html>

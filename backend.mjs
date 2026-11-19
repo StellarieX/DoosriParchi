@@ -2,6 +2,7 @@ import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, ran
 import qrcode from "qrcode";
 import { clinics, disclosure, hasConflict, toFhir } from "./public/case.mjs";
 import { exportReceiptDomain } from "./public/export-receipt.mjs";
+import { intakeDomain, qrPassDomain, splitSignedToken } from "./public/issuer-keys.mjs";
 import {
   RequestError, syncEnabled, signIn, signUp, signOut, userFor, registerPass, recordAcceptance, listReferrals, loadDetails,
   manageReferral, patientReferral, changeAppointment, recordExport
@@ -23,8 +24,22 @@ const privateKey = configuredKey
   ? createPrivateKey({ key: Buffer.from(configuredKey, "base64"), format: "der", type: "pkcs8" })
   : generateKeyPairSync("ed25519").privateKey;
 if (privateKey.asymmetricKeyType !== "ed25519") throw new Error("Use an Ed25519 signing key.");
-const verificationKey = createPublicKey(privateKey);
-const publicKey = verificationKey.export({ type: "spki", format: "der" }).toString("base64url");
+function keyId(publicDer) {
+  return createHash("sha256").update(publicDer).digest("base64url");
+}
+
+const publicDer = createPublicKey(privateKey).export({ type: "spki", format: "der" });
+const publicKey = publicDer.toString("base64url");
+const activeKeyId = keyId(publicDer);
+const issuerPublicKeys = { [activeKeyId]: publicKey };
+for (const encoded of (process.env.REFERRAL_VERIFY_KEYS ?? "").split(",").map(value => value.trim()).filter(Boolean)) {
+  const key = createPublicKey({ key: Buffer.from(encoded, "base64"), type: "spki", format: "der" });
+  if (key.asymmetricKeyType !== "ed25519") throw new Error("Use Ed25519 public keys for retired issuers.");
+  const der = key.export({ type: "spki", format: "der" });
+  issuerPublicKeys[keyId(der)] = der.toString("base64url");
+}
+const issuerVerifyKeys = Object.fromEntries(Object.entries(issuerPublicKeys).map(([id, key]) =>
+  [id, createPublicKey({ key: Buffer.from(key, "base64url"), type: "spki", format: "der" })]));
 const passLifetime = 24 * 60 * 60 * 1000;
 export function send(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -78,38 +93,51 @@ async function issue({ clinic, fields, cleaned, answer, language, printMode }, u
   const paperItems = printMode === "private" ? [] : printMode === "minimal" ? items.filter(item => item.id === "result") : items;
   const pass = referralPass(id, clinic, issued, issued + passLifetime, printMode, paperItems);
   const signed = await signedQr(pass);
-  if (user) await registerPass(pass, items, user);
+  if (user) await registerPass(pass, items, user, signed.token);
   return { ...signed, ...(printMode !== "full" && { onlineItems: items }) };
 }
 
-function referralPass(id, clinic, issued, expires, printMode, items) {
-  return { v: 1, id, issuer: "Cedar Health", clinic, issued, expires, printMode,
-    ...(printMode !== "private" && { patient: "Asha Das" }), items };
+function signToken(payload, domain) {
+  const wire = JSON.stringify(payload);
+  const signature = sign(null, Buffer.from(domain + wire), privateKey).toString("base64url");
+  return Buffer.from(wire).toString("base64url") + "." + signature;
 }
 
-async function signedQr(pass) {
-  const bytes = Buffer.from(JSON.stringify(pass));
-  const token = bytes.toString("base64url") + "." + sign(null, bytes, privateKey).toString("base64url");
+function referralPass(id, clinic, issued, expires, printMode, items, legacy = false) {
+  const version = legacy ? { v: 1 } : { v: 2, kid: activeKeyId };
+  return { ...version, id, issuer: "Cedar Health", clinic, issued, expires, printMode,
+    ...(printMode !== "private" && { patient: "Asha Das" }), items,
+    ...(!legacy && printMode === "minimal" && {
+      intakeProof: signToken({ v: 1, kind: "referral-intake", kid: activeKeyId, id, clinic, expires }, intakeDomain)
+    }) };
+}
+
+async function signedQr(pass, token = signToken(pass, pass.v === 2 ? qrPassDomain : "")) {
   const qr = await qrcode.toDataURL(token, { errorCorrectionLevel: "M", margin: 4, scale: 7 });
   return { pass, token, qr };
 }
 
-function checkedPass({ token, clinic }, allowExpired = false) {
-  if (typeof token !== "string" || token.length > 3000 || !Object.hasOwn(clinics, clinic)) {
+function checkedPass({ token, clinic }, forIntake = false) {
+  if (typeof token !== "string" || !Object.hasOwn(clinics, clinic)) {
     throw new RequestError(400, "Choose a clinic and scan a referral.");
   }
-  const [payload, signature, extra] = token.split(".");
-  if (extra !== undefined || !payload || !signature || !/^[A-Za-z0-9_-]+$/.test(payload) ||
-      !/^[A-Za-z0-9_-]+$/.test(signature) || !verify(null, Buffer.from(payload, "base64url"),
-        verificationKey, Buffer.from(signature, "base64url"))) {
+  let parsed;
+  try { parsed = splitSignedToken(token); }
+  catch { throw new RequestError(422, "The referral format could not be verified."); }
+  const { payload: pass, bytes, wire, signature } = parsed;
+  const proof = forIntake && pass?.v === 1 && pass.kind === "referral-intake";
+  const legacy = pass?.v === 1 && pass.kind === undefined && pass.kid === undefined;
+  const valid = pass && (proof || (legacy || pass.v === 2) && Array.isArray(pass.items)) &&
+    typeof pass.id === "string" && Number.isFinite(pass.expires);
+  if (!valid) throw new RequestError(422, "The referral format could not be verified.");
+  const keys = legacy ? Object.values(issuerVerifyKeys)
+    : Object.hasOwn(issuerVerifyKeys, pass.kid) ? [issuerVerifyKeys[pass.kid]] : [];
+  const message = legacy ? bytes : Buffer.from((proof ? intakeDomain : qrPassDomain) + wire);
+  if (!keys.some(key => verify(null, message, key, signature))) {
     throw new RequestError(422, "The referral signature could not be verified.");
   }
-  const pass = JSON.parse(Buffer.from(payload, "base64url"));
-  if (pass.v !== 1 || typeof pass.id !== "string" || !Number.isFinite(pass.expires) || !Array.isArray(pass.items)) {
-    throw new RequestError(422, "The referral format could not be verified.");
-  }
   if (pass.clinic !== clinic) throw new RequestError(403, "This pass is addressed to another clinic.");
-  if (!allowExpired && pass.expires <= Date.now()) throw new RequestError(410, "This referral has expired.");
+  if (!forIntake && pass.expires <= Date.now()) throw new RequestError(410, "This referral has expired.");
   return pass;
 }
 
@@ -119,12 +147,12 @@ export function requestOrigin(req) {
   if (/^(127\.0\.0\.1|localhost):\d+$/.test(host ?? "")) return "http://" + host;
 }
 
-const getRoutes = ["/api/key", "/api/session", "/api/referrals", "/healthz"];
+const getRoutes = ["/api/key", "/api/sample", "/api/session", "/api/referrals", "/healthz"];
 const postRoutes = ["/api/login", "/api/signup", "/api/logout", "/api/issue", "/api/check", "/api/accept", "/api/details", "/api/manage",
   "/api/recover", "/api/appointment"];
 
 function checkReferralId(id) {
-  if (typeof id !== "string" || !id.trim() || id.length > 80) {
+  if (typeof id !== "string" || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) {
     throw new RequestError(400, "Choose a referral.");
   }
 }
@@ -136,6 +164,12 @@ async function recover({ id }, user) {
   if (!row) throw new RequestError(404, "The issuer could not find this referral.");
   const expires = Date.parse(row.expires_at);
   if (expires <= Date.now()) throw new RequestError(410, "This QR expired. Review a fresh referral to share again.");
+  if (row.revoked_at) throw new RequestError(410, "This referral was revoked. Review a fresh referral to share again.");
+  if (row.qr_token) {
+    const pass = checkedPass({ token: row.qr_token, clinic: row.clinic });
+    if (pass.id !== row.id) throw new RequestError(409, "Review a fresh referral to share again.");
+    return signedQr(pass, row.qr_token);
+  }
   if (!["private", "minimal", "full"].includes(row.print_mode) || !Array.isArray(row.paper_ids) || !Array.isArray(row.items)) {
     throw new RequestError(409, "This referral predates QR recovery. Review a fresh referral to share again.");
   }
@@ -146,7 +180,7 @@ async function recover({ id }, user) {
     throw new RequestError(409, "The printed contents could not be recovered. Review a fresh referral to share again.");
   }
   const paper = items.map(({ id, label, text }) => ({ id, label, text }));
-  return signedQr(referralPass(row.id, row.clinic, Date.parse(row.issued_at), expires, row.print_mode, paper));
+  return signedQr(referralPass(row.id, row.clinic, Date.parse(row.issued_at), expires, row.print_mode, paper, true));
 }
 
 async function appointment({ id, action, proposalId = null, startsAt, instructions = "" }, user) {
@@ -172,9 +206,9 @@ async function appointment({ id, action, proposalId = null, startsAt, instructio
     action === "propose" ? instructions.trim() : null);
 }
 
-async function manage({ id, action, reason }, user) {
+async function manage({ id, action, reason, itemId }, user) {
   checkReferralId(id);
-  if (!["review", "withdraw", "request", "approve", "decline"].includes(action)) {
+  if (!["review", "withdraw", "revoke", "request", "approve", "decline"].includes(action)) {
     throw new RequestError(400, "Choose a referral action.");
   }
   if (action === "request") {
@@ -183,23 +217,42 @@ async function manage({ id, action, reason }, user) {
     }
     reason = reason.trim();
   }
-  return manageReferral(id, user, action, action === "request" ? reason : null);
+  if (action === "withdraw" && itemId !== undefined &&
+      !["result", "history", "note", "previous-result"].includes(itemId)) {
+    throw new RequestError(400, "Choose an item to withdraw.");
+  }
+  return manageReferral(id, user, action, { reason, itemId });
+}
+
+function signedExport({ id, clinic, issued, expires, items, appointment, sample, exportedAt = new Date().toISOString() }) {
+  const receiptId = randomUUID();
+  const bundle = JSON.stringify(toFhir({ id, issued, expires, items, clinic, appointment, receiptId, exportedAt }), null, 2);
+  const manifest = {
+    v: 1, kind: "fhir-export", kid: activeKeyId, receiptId, referralId: id, clinic, exportedAt,
+    sha256: createHash("sha256").update(bundle, "utf8").digest("hex"), ...(sample && { sample: true })
+  };
+  return { bundle, receipt: signToken(manifest, exportReceiptDomain) };
 }
 
 async function exportReferral(id, user, signedPass) {
-  const { items, issuedAt } = await loadDetails(id, user, signedPass, "prepare_export");
-  const bundle = JSON.stringify(toFhir({ id, issued: Date.parse(issuedAt), items }), null, 2);
-  const exportedAt = new Date().toISOString();
-  const manifest = {
-    v: 1, kind: "fhir-export", receiptId: randomUUID(), referralId: id, clinic: user.clinic, exportedAt,
-    sha256: createHash("sha256").update(bundle, "utf8").digest("hex")
-  };
-  const payload = JSON.stringify(manifest);
-  const signature = sign(null, Buffer.from(exportReceiptDomain + payload), privateKey).toString("base64url");
-  const receipt = Buffer.from(payload).toString("base64url") + "." + signature;
-  const { recorded } = await recordExport(id, user, signedPass, items, receipt);
+  const snapshot = await loadDetails(id, user, signedPass, "prepare_export");
+  const { items, issuedAt, expiresAt, appointment } = snapshot;
+  const { bundle, receipt } = signedExport({
+    id, clinic: user.clinic, issued: Date.parse(issuedAt), expires: Date.parse(expiresAt), items, appointment
+  });
+  const { recorded } = await recordExport(id, user, signedPass, snapshot, receipt);
   if (!recorded) throw new RequestError(503, "The export receipt could not be saved. Try again.");
   return { items, bundle, receipt };
+}
+
+function rehearsalExports() {
+  const issued = Date.now() - 2000;
+  const sample = { id: randomUUID(), clinic: "north", issued, expires: issued + passLifetime, sample: true };
+  return {
+    reference: sample.id,
+    before: signedExport({ ...sample, items: disclosure(["result", "note"], true), exportedAt: new Date(issued + 1000).toISOString() }),
+    after: signedExport({ ...sample, items: disclosure(["result"], true), exportedAt: new Date(issued + 2000).toISOString() })
+  };
 }
 
 export async function handleApi(req, res, path) {
@@ -215,7 +268,8 @@ export async function handleApi(req, res, path) {
       throw new RequestError(403, "Use the configured referral workspace.");
     }
     if (path === "/healthz") return send(res, 200, { ok: true });
-    if (path === "/api/key") return send(res, 200, { publicKey });
+    if (path === "/api/key") return send(res, 200, { publicKey, activeKeyId, keys: issuerPublicKeys });
+    if (path === "/api/sample") return send(res, 200, rehearsalExports());
     const data = req.method === "POST" ? await bodyOf(req) : undefined;
     if (!syncEnabled) {
       if (path === "/api/session") return send(res, 200, { enabled: false, user: null });
@@ -230,7 +284,7 @@ export async function handleApi(req, res, path) {
     if (path === "/api/signup") return send(res, 200, await signUp(data, origin));
     if (path === "/api/login") return send(res, 200, await signIn(data, res, secure));
     if (path === "/api/logout") return send(res, 200, await signOut(req, res, secure));
-    const user = await userFor(req);
+    const user = await userFor(req, res, secure);
     if (path === "/api/session") return send(res, 200, { enabled: true, user });
     if (!user) throw new RequestError(401, "Sign in to continue.");
     if (path === "/api/referrals") return send(res, 200, { referrals: await listReferrals(user) });
@@ -247,16 +301,25 @@ export async function handleApi(req, res, path) {
       if (!["view", "export"].includes(purpose) || (token !== undefined && id !== undefined)) {
         throw new RequestError(400, "Choose one referral and a valid access purpose.");
       }
-      if (token !== undefined) {
-        const pass = checkedPass({ token, clinic: user.clinic });
-        const details = purpose === "export" ? await exportReferral(pass.id, user, true) : await loadDetails(pass.id, user, true, "view");
-        return send(res, 200, pass.printMode === "private" ? { ...details, patient: "Asha Das" } : details);
-      }
-      checkReferralId(id);
-      return send(res, 200, purpose === "export" ? await exportReferral(id, user, false) : await loadDetails(id, user, false, "view"));
+      const referralId = token === undefined ? id : checkedPass({ token, clinic: user.clinic }).id;
+      checkReferralId(referralId);
+      const details = purpose === "export" ? await exportReferral(referralId, user, false)
+        : await loadDetails(referralId, user, false, "view");
+      return send(res, 200, { ...details, patient: "Asha Das" });
     }
     const pass = checkedPass({ token: data.token, clinic: user.clinic }, path === "/api/accept");
-    if (path === "/api/accept") return send(res, 200, { receipt: await recordAcceptance(pass, user) });
+    if (path === "/api/accept") {
+      const receipt = await recordAcceptance(pass, user);
+      if (data.includeDetails !== true || pass.expires <= Date.now()) return send(res, 200, { receipt });
+      let details;
+      try {
+        details = await loadDetails(pass.id, user, false, "view");
+      } catch (error) {
+        if (error.status >= 500 || !error.status) console.error(error);
+        return send(res, 200, { receipt, detailsUnavailable: true });
+      }
+      return send(res, 200, { receipt, ...details, patient: "Asha Das" });
+    }
     return send(res, 200, { checkedAt: Date.now() });
   } catch (error) {
     if (!error.status) console.error(error);

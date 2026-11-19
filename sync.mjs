@@ -37,9 +37,16 @@ async function database(path, body, prefer = "return=representation") {
   return response.json();
 }
 
-function cookie(value, lifetime, secure) {
-  return "referral_access=" + value + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + lifetime +
+function cookie(name, value, lifetime, secure) {
+  return name + "=" + value + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + lifetime +
     (secure ? "; Secure" : "");
+}
+
+function setSessionCookies(response, session, secure) {
+  response.setHeader("Set-Cookie", [
+    cookie("referral_access", session?.access_token ?? "", session?.expires_in ?? 0, secure),
+    cookie("referral_refresh", session?.refresh_token ?? "", session?.refresh_token ? 8 * 60 * 60 : 0, secure)
+  ]);
 }
 
 export async function signIn({ email, password }, response, secure) {
@@ -55,9 +62,9 @@ export async function signIn({ email, password }, response, secure) {
     if (error_code === "email_not_confirmed") throw new RequestError(401, "Confirm your email before signing in.");
     throw new RequestError(401, "Email or password is incorrect.");
   }
-  const { access_token, expires_in, user } = await login.json();
-  const account = await accountFor(user, true);
-  response.setHeader("Set-Cookie", cookie(access_token, expires_in, secure));
+  const session = await login.json();
+  const account = await accountFor(session.user, true);
+  setSessionCookies(response, session, secure);
   return { enabled: true, user: account };
 }
 
@@ -84,19 +91,31 @@ export async function signUp({ email, password }, origin) {
 }
 
 export async function signOut(request, response, secure) {
-  const token = accessToken(request);
-  response.setHeader("Set-Cookie", cookie("", 0, secure));
-  if (token) {
-    const result = await supabase("/auth/v1/logout?scope=local", { authorization: token, body: {} });
-    if (!result.ok && ![401, 403].includes(result.status)) {
-      throw new RequestError(503, "Signed out on this device. Account sign-out could not be confirmed.");
-    }
+  setSessionCookies(response, null, secure);
+  const target = "/auth/v1/logout?scope=local";
+  const token = cookieValue(request, "referral_access");
+  let result = token ? await supabase(target, { authorization: token, body: {} }) : null;
+  if (!result || [401, 403].includes(result.status)) {
+    const renewed = await refreshSession(request);
+    if (renewed) result = await supabase(target, { authorization: renewed.access_token, body: {} });
+  }
+  if (result && !result.ok && ![401, 403].includes(result.status)) {
+    throw new RequestError(503, "Signed out on this device. Account sign-out could not be confirmed.");
   }
   return { enabled: true, user: null };
 }
 
-function accessToken(request) {
-  return /(?:^|;\s*)referral_access=([\w.-]+)(?:;|$)/.exec(request.headers.cookie ?? "")?.[1];
+function cookieValue(request, name) {
+  return new RegExp("(?:^|;\\s*)" + name + "=([\\w.-]+)(?:;|$)").exec(request.headers.cookie ?? "")?.[1];
+}
+
+async function refreshSession(request) {
+  const refreshToken = cookieValue(request, "referral_refresh");
+  if (!refreshToken) return null;
+  const response = await supabase("/auth/v1/token?grant_type=refresh_token", { body: { refresh_token: refreshToken } });
+  if ([400, 401, 403].includes(response.status)) return null;
+  if (!response.ok) throw new RequestError(503, "Account refresh is temporarily unavailable. Try again.");
+  return response.json();
 }
 
 async function accountFor(user, provisionPatient = false) {
@@ -112,27 +131,30 @@ async function accountFor(user, provisionPatient = false) {
   return { id: user.id, email: user.email, clinic: account.clinic };
 }
 
-export async function userFor(request) {
-  const token = accessToken(request);
-  if (!token) return null;
-  const response = await supabase("/auth/v1/user", { authorization: token });
-  if ([401, 403].includes(response.status)) return null;
-  if (!response.ok) throw new RequestError(503, "Account sync is temporarily unavailable.");
-  return accountFor(await response.json());
+export async function userFor(request, response, secure) {
+  const token = cookieValue(request, "referral_access");
+  if (token) {
+    const lookup = await supabase("/auth/v1/user", { authorization: token });
+    if (lookup.ok) return accountFor(await lookup.json());
+    if (![401, 403].includes(lookup.status)) throw new RequestError(503, "Account sync is temporarily unavailable.");
+  }
+  const session = await refreshSession(request);
+  if (!session) return null;
+  const account = await accountFor(session.user);
+  setSessionCookies(response, session, secure);
+  return account;
 }
 
-export async function registerPass(pass, items, user) {
+export async function registerPass(pass, items, user, qrToken) {
   await database("referral_intake", {
     id: pass.id, patient_id: user.id, clinic: pass.clinic, items,
-    print_mode: pass.printMode, paper_ids: pass.items.map(item => item.id),
+    print_mode: pass.printMode, paper_ids: pass.items.map(item => item.id), qr_token: qrToken,
     issued_at: new Date(pass.issued).toISOString(), expires_at: new Date(pass.expires).toISOString()
   });
 }
 
-export async function recordAcceptance(pass, user) {
-  const [receipt] = await database("rpc/accept_referral", { referral_id: pass.id, staff_user: user.id });
-  if (!receipt) throw new RequestError(409, "The referral is unavailable or expired.");
-  return receipt;
+export function recordAcceptance(pass, user) {
+  return referralAction("accept_referral_status", { referral_id: pass.id, staff_user: user.id });
 }
 
 async function referralAction(rpc, body) {
@@ -147,20 +169,22 @@ export function loadDetails(id, user, signedPass, purpose) {
   });
 }
 
-export function recordExport(id, user, signedPass, items, receipt) {
+export function recordExport(id, user, signedPass, snapshot, receipt) {
   return referralAction("record_referral_export", {
-    referral_id: id, staff_user: user.id, signed_pass: signedPass, expected_items: items, signed_receipt: receipt
+    referral_id: id, staff_user: user.id, signed_pass: signedPass, expected_items: snapshot, signed_receipt: receipt
   });
 }
 
-export function manageReferral(id, user, action, reason) {
+export function manageReferral(id, user, action, { reason, itemId }) {
+  // The RPC uses one argument for action-specific input and keeps the legacy signature.
+  const input = action === "request" ? reason : action === "withdraw" ? itemId ?? "note" : null;
   return referralAction("manage_referral", {
-    referral_id: id, actor_user: user.id, manage_action: action, request_reason: reason
+    referral_id: id, actor_user: user.id, manage_action: action, request_reason: input
   });
 }
 
 export async function patientReferral(id, user) {
-  const query = new URLSearchParams({ select: "id,clinic,issued_at,expires_at,print_mode,paper_ids,items",
+  const query = new URLSearchParams({ select: "id,clinic,issued_at,expires_at,print_mode,paper_ids,items,revoked_at,qr_token",
     id: "eq." + id, patient_id: "eq." + user.id, limit: "1" });
   const [row] = await database("referral_intake?" + query);
   return row;
@@ -175,12 +199,16 @@ export function changeAppointment(id, user, action, proposalId, startsAt, instru
 
 export async function listReferrals(user) {
   const query = new URLSearchParams({
-    select: "id,clinic,issued_at,expires_at,accepted_at,appointment",
+    select: "id,clinic,issued_at,expires_at,accepted_at,appointment,revoked_at",
     order: user.clinic ? "accepted_at.desc" : "issued_at.desc", limit: "40"
   });
   if (user.clinic) {
     query.set("clinic", "eq." + user.clinic);
     query.set("accepted_at", "not.is.null");
   } else query.set("patient_id", "eq." + user.id);
-  return database("referral_intake?" + query);
+  const rows = await database("referral_intake?" + query);
+  return rows.map(({ revoked_at, ...row }) => {
+    if (user.clinic && revoked_at) row.appointment = null;
+    return revoked_at ? { ...row, revoked_at } : row;
+  });
 }

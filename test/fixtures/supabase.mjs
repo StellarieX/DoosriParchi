@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
+import { disclosure, sourceNote } from "../../public/case.mjs";
 
 export const mockPublishableKey = "sb_publishable_test";
 export const mockSecretKey = "sb_secret_test";
@@ -11,8 +12,10 @@ const accounts = [
   { id: "south-1", email: "south@example.test", clinic: "south" }
 ];
 const previousResult = {
-  id: "previous-result", label: "Previous hemoglobin", text: "Hemoglobin · 11.6 g/dL"
+  id: "previous-result", label: "Previous hemoglobin", text: "Hemoglobin · 11.6 g/dL",
+  valueQuantity: { value: 11.6, unit: "g/dL" }
 };
+const cleanNote = disclosure(["note"], true)[0].text;
 const error = (status, message) => ({ status, message });
 const expired = row => Date.parse(row.expires_at) <= Date.now();
 
@@ -20,15 +23,23 @@ function addEvent(row, kind, itemIds, at = new Date().toISOString()) {
   row.events.push({ kind, at, itemIds });
 }
 
-function referralDetails(row, account, { signed_pass, access_purpose }) {
+function referralDetails(row, account, { access_purpose }) {
   if (!account?.clinic) return error(403, "A clinic account is required.");
   if (!row || row.clinic !== account.clinic) return error(404, "Referral unavailable.");
+  if (row.revoked_at) return error(410, "Online access to this referral was revoked.");
   if (expired(row)) return error(410, "Referral expired.");
-  if (!signed_pass && !row.accepted_at) return error(409, "Accept the referral first.");
-  if (!["view", "export", "prepare_export"].includes(access_purpose)) return error(400, "Choose an access purpose.");
-  const items = row.items.filter(item => item.id !== "note" || !row.withdrawn);
-  if (row.request?.status === "approved") items.push(previousResult);
-  if (access_purpose === "prepare_export") return { items, issuedAt: row.issued_at };
+  if (!row.accepted_at) return error(409, "Accept the referral first.");
+  if (!["view", "prepare_export"].includes(access_purpose)) return error(400, "Choose an access purpose.");
+  const items = row.items.filter(item => !row.withdrawn_items.includes(item.id)).flatMap(item => {
+    if (item.id !== "note" || !row.withdrawn_items.includes("history")) return [item];
+    return [cleanNote, sourceNote].includes(item.text) ? [{ ...item, text: cleanNote }] : [];
+  });
+  if (row.request?.status === "approved" && !row.withdrawn_items.includes("previous-result")) items.push(previousResult);
+  if (access_purpose === "prepare_export") {
+    const slot = row.appointment;
+    const appointment = slot?.status === "confirmed" ? { id: slot.id, status: slot.status, startsAt: slot.startsAt } : null;
+    return { items, issuedAt: row.issued_at, expiresAt: row.expires_at, appointment };
+  }
   addEvent(row, access_purpose, items.map(item => item.id));
   return { items };
 }
@@ -42,15 +53,31 @@ function manageReferral(row, account, { manage_action: action, request_reason: r
   if (!row || (isClinic ? row.clinic !== account.clinic : row.patient_id !== account.id)) {
     return error(404, "Referral unavailable.");
   }
-  if ((isClinic || action !== "review") && expired(row)) return error(410, "Referral expired.");
   if (isClinic && !row.accepted_at) return error(409, "Accept the referral first.");
+  if (!["review", "revoke"].includes(action)) {
+    if (row.revoked_at) return error(410, "Online access to this referral was revoked.");
+    if (expired(row)) return error(410, "Referral expired.");
+  }
 
-  if (action === "withdraw" && !row.withdrawn) {
-    if (row.paper_ids.includes("note") || !row.items.some(item => item.id === "note")) {
-      return error(409, "There is no online-only note to withdraw.");
+  const printedIds = row.paper_ids ?? row.items.map(item => item.id);
+  if (action === "withdraw") {
+    const id = reason ?? "note";
+    const isApproved = id === "previous-result" && row.request?.status === "approved";
+    if (printedIds.includes(id) || (!isApproved && !row.items.some(item => item.id === id))) {
+      return error(409, "This referral does not share that item online only.");
     }
-    row.withdrawn = true;
-    addEvent(row, action, ["note"]);
+    if (!row.withdrawn_items.includes(id)) {
+      const ids = [id];
+      if (id === "history" && !row.withdrawn_items.includes("note") &&
+          row.items.some(item => item.id === "note" && ![cleanNote, sourceNote].includes(item.text))) ids.push("note");
+      row.withdrawn_items.push(...ids);
+      addEvent(row, action, ids);
+    }
+  }
+  if (action === "revoke" && !row.revoked_at) {
+    if (expired(row)) return error(410, "Referral expired.");
+    row.revoked_at = new Date().toISOString();
+    addEvent(row, action, [], row.revoked_at);
   }
   if (action === "request") {
     reason = reason?.trim();
@@ -73,10 +100,16 @@ function manageReferral(row, account, { manage_action: action, request_reason: r
   }
 
   const access = row.events.filter(event => ["view", "export"].includes(event.kind));
+  const accessStatus = row.revoked_at ? "revoked" : expired(row) ? "expired" : "active";
+  const withdrawn = row.withdrawn_items.includes("note");
   return { review: {
-    printMode: row.print_mode, paperIds: row.paper_ids, withdrawn: row.withdrawn,
+    printMode: row.print_mode ?? "unknown", paperIds: printedIds,
+    withdrawn, withdrawnIds: row.withdrawn_items,
+    noteRedacted: !withdrawn && row.withdrawn_items.includes("history") &&
+      row.items.some(item => item.id === "note" && item.text === sourceNote),
+    revokedAt: row.revoked_at, accessStatus,
     sharedIds: [...new Set(access.flatMap(event => event.itemIds))],
-    request: row.request, events: row.events,
+    request: isClinic && accessStatus !== "active" ? null : row.request, events: row.events,
     ...(!isClinic && { items: [...row.items, previousResult] })
   } };
 }
@@ -86,6 +119,7 @@ function appointmentUpdate(row, account, { decision, expected_proposal, proposed
     return error(404, "Referral unavailable.");
   }
   if (Boolean(account.clinic) !== (decision === "propose")) return error(403, "Action unavailable.");
+  if (row.revoked_at) return error(410, "Online access to this referral was revoked.");
   if (!row.accepted_at) return error(409, "Accept the referral first.");
   const slot = row.appointment;
   if ((slot?.id ?? null) !== expected_proposal) return error(409, "The appointment changed.");
@@ -100,12 +134,22 @@ function appointmentUpdate(row, account, { decision, expected_proposal, proposed
     }
     row.appointment = { ...slot, status };
   }
+  addEvent(row, "appointment_" + row.appointment.status, []);
   return { appointment: row.appointment };
 }
 
 export async function startMockSupabase() {
   const rows = new Map();
   const tokens = new Map();
+  const refreshTokens = new Map();
+  function sessionFor(user) {
+    const access = "test-token-" + randomUUID();
+    const refresh = "test-refresh-" + randomUUID();
+    tokens.set(access, { user, refresh });
+    refreshTokens.set(refresh, { user, access });
+    const { id, email, email_confirmed_at, app_metadata } = user;
+    return { access_token: access, refresh_token: refresh, expires_in: 3600, user: { id, email, email_confirmed_at, app_metadata } };
+  }
   const calls = [];
   const workspaceAccounts = new Map(accounts.map(account => [account.id, account]));
   const signups = new Map();
@@ -130,21 +174,27 @@ export async function startMockSupabase() {
         return send(200, user);
       }
       if (url.pathname === "/auth/v1/token") {
+        if (url.searchParams.get("grant_type") === "refresh_token") {
+          const saved = refreshTokens.get(body.refresh_token);
+          if (!saved) return send(400, { error_code: "refresh_token_not_found" });
+          refreshTokens.delete(body.refresh_token);
+          tokens.delete(saved.access);
+          return send(200, sessionFor(saved.user));
+        }
         const signup = signups.get(body.email);
         const user = signup?.user ?? accounts.find(account => account.email === body.email);
         if (!user || body.password !== (signup?.password ?? "demo-password")) return send(400, { message: "Invalid credentials" });
         if (signup && !user.email_confirmed_at) return send(400, { error_code: "email_not_confirmed" });
-        const token = "test-token-" + randomUUID();
-        tokens.set(token, user);
-        const { id, email, email_confirmed_at, app_metadata } = user;
-        return send(200, { access_token: token, expires_in: 3600, user: { id, email, email_confirmed_at, app_metadata } });
+        return send(200, sessionFor(user));
       }
       const token = request.headers.authorization?.replace(/^Bearer /, "");
-      const user = tokens.get(token);
-      if (!user) return send(401, { message: "Invalid session" });
+      const session = tokens.get(token);
+      if (!session) return send(401, { message: "Invalid session" });
+      const { user } = session;
       if (url.pathname === "/auth/v1/user") return send(200, { id: user.id, email: user.email });
       if (url.pathname === "/auth/v1/logout") {
         tokens.delete(token);
+        refreshTokens.delete(session.refresh);
         return send(200, {});
       }
     }
@@ -161,7 +211,8 @@ export async function startMockSupabase() {
       if (url.pathname === "/rest/v1/referral_intake" && request.method === "POST") {
         if (rows.has(body.id)) return send(409, { message: "Duplicate referral" });
         const row = {
-          ...body, accepted_at: null, accepted_by: null, appointment: null, withdrawn: false, request: null, events: []
+          ...body, accepted_at: null, accepted_by: null, appointment: null, withdrawn_items: [], revoked_at: null,
+          request: null, events: []
         };
         addEvent(row, "issued", row.paper_ids, row.issued_at);
         rows.set(row.id, row);
@@ -179,17 +230,20 @@ export async function startMockSupabase() {
         const columns = url.searchParams.get("select").split(",");
         return send(200, selected.map(row => Object.fromEntries(columns.map(column => [column, row[column]]))));
       }
-      if (url.pathname === "/rest/v1/rpc/accept_referral") {
+      if (url.pathname === "/rest/v1/rpc/accept_referral_status") {
         const row = rows.get(body.referral_id);
         const account = workspaceAccounts.get(body.staff_user);
-        if (!row || !account?.clinic || row.clinic !== account.clinic ||
-            (!row.accepted_at && expired(row))) return send(200, []);
+        if (!row || !account?.clinic || row.clinic !== account.clinic) {
+          return send(200, error(404, "Referral unavailable."));
+        }
+        if (row.revoked_at) return send(200, error(410, "Online access to this referral was revoked."));
         if (!row.accepted_at) {
+          if (expired(row)) return send(200, error(410, "Referral expired."));
           row.accepted_at = new Date().toISOString();
           row.accepted_by = account.id;
           addEvent(row, "intake", row.paper_ids, row.accepted_at);
         }
-        return send(200, [{ id: row.id, accepted_at: row.accepted_at }]);
+        return send(200, { id: row.id, accepted_at: row.accepted_at });
       }
       if (url.pathname === "/rest/v1/rpc/referral_details") {
         const account = workspaceAccounts.get(body.staff_user);
@@ -200,7 +254,7 @@ export async function startMockSupabase() {
         const account = workspaceAccounts.get(body.staff_user);
         const snapshot = referralDetails(row, account, { ...body, access_purpose: "prepare_export" });
         if (snapshot.status) return send(200, snapshot);
-        if (JSON.stringify(snapshot.items) !== JSON.stringify(body.expected_items)) return send(200, error(409, "Sharing changed during export."));
+        if (JSON.stringify(snapshot) !== JSON.stringify(body.expected_items)) return send(200, error(409, "Sharing changed during export."));
         row.events.push({ kind: "export", at: new Date().toISOString(), itemIds: snapshot.items.map(item => item.id), receipt: body.signed_receipt });
         return send(200, { recorded: true });
       }

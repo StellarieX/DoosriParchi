@@ -139,6 +139,11 @@ form button { margin-top: 10px; }
 .pass-qr { width: min(100%, 280px); height: auto; display: block; background: white; border: 1px solid var(--line); }
 .share-followup { border-top: 1px solid var(--line); padding-top: 8px; }
 .share-followup button { padding-inline: 0; border-color: transparent; text-decoration: underline; text-underline-offset: 3px; }
+.demo-case .controls { padding-top: 12px; }
+.demo-case .controls h2 { margin-bottom: 12px; }
+.demo-case .warning p, .sample-sheet .entry:last-of-type p { margin-bottom: 0; }
+.sample-files { padding-left: 20px; line-height: 1.8; font-size: .86rem; }
+.sample-files a { color: var(--accent); text-underline-offset: 3px; }
 .verified-tag { display: inline-block; color: #345b46; border: 1px solid #a8bfad; border-radius: 3px; padding: 4px 8px; font-size: .76rem; font-weight: 660; }
 video { width: 100%; margin-top: 14px; border-radius: 4px; background: var(--ink); }
 @media (max-width: 900px) {
@@ -312,10 +317,15 @@ video { width: 100%; margin-top: 14px; border-radius: 4px; background: var(--ink
 .verifier-card input::file-selector-button { margin-right: 8px; padding: 7px 10px; border: 1px solid var(--control); border-radius: 5px; background: var(--mint); color: var(--ink); cursor: pointer; }
 .verifier-card button { justify-self: start; }
 .verifier-card p, .verifier-card .metadata { margin: 0; }
+.verifier-card .metadata dd { overflow-wrap: anywhere; }
 .verifier-card p:empty { display: none; }
 .verifier-card[data-state="verified"] { background: var(--mint); border-color: #78a797; }
 .verifier-card[data-state="error"], #edit-result:not(:empty) { background: #f8f2e2; color: #513c18; }
 #edit-result:not(:empty) { padding: 9px 11px; border-radius: 5px; font-size: .9rem; }
+.simulated-receiver { margin-top: 20px; }
+.simulated-receiver ul { list-style: none; margin: 0; padding: 0; }
+.simulated-receiver li { padding: 12px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.simulated-receiver li p { font-size: .9rem; margin-top: 4px; }
 .detail-offline { color: #6a4b17; }
 @media(max-width: 800px) {
   .activity-columns { grid-template-columns: 1fr; }

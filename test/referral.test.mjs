@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { createPublicKey, verify } from "node:crypto";
+import { createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
+import { qrPassDomain, signedByIssuer, splitSignedToken } from "../public/issuer-keys.mjs";
+import { exportReceiptDomain, verifyExportReceipt } from "../public/export-receipt.mjs";
 import { createInterface } from "node:readline";
 import { after, before, test } from "node:test";
 import { toFhir } from "../public/case.mjs";
@@ -14,11 +16,13 @@ const request = (path, body) => fetch(base + path, body && {
   body: JSON.stringify(body)
 });
 const draft = { clinic: "north", fields: ["result", "note"], cleaned: true, answer: "no", language: "hi" };
+const retired = generateKeyPairSync("ed25519");
 
 before(async () => {
   server = spawn(process.execPath, ["server.mjs"], {
     cwd: new URL("../", import.meta.url),
-    env: { ...process.env, NODE_ENV: "test", HOST: "127.0.0.1", PORT: "0", PUBLIC_ORIGIN: "" },
+    env: { ...process.env, NODE_ENV: "test", HOST: "127.0.0.1", PORT: "0", PUBLIC_ORIGIN: "",
+      REFERRAL_VERIFY_KEYS: retired.publicKey.export({ type: "spki", format: "der" }).toString("base64") },
     stdio: ["ignore", "pipe", "inherit"], windowsHide: true
   });
   const lines = createInterface({ input: server.stdout });
@@ -58,7 +62,7 @@ test("the pass contains exactly the approved fields and a valid signature", asyn
   const body = Buffer.from(encoded, "base64url");
   const { publicKey } = await (await request("/api/key")).json();
   const key = createPublicKey({ key: Buffer.from(publicKey, "base64url"), type: "spki", format: "der" });
-  assert.equal(verify(null, body, key, Buffer.from(signature, "base64url")), true);
+  assert.equal(verify(null, Buffer.concat([Buffer.from(qrPassDomain), body]), key, Buffer.from(signature, "base64url")), true);
   assert.deepEqual(JSON.parse(body), pass);
   assert.deepEqual(pass.items.map(item => item.id), ["result", "note"]);
   assert.doesNotMatch(body.toString(), /depression/i);
@@ -78,4 +82,32 @@ test("explicit consent can include the history and match the outgoing referral n
   const bundle = toFhir(pass);
   assert.equal(bundle.entry.some(({ resource }) => resource.resourceType === "Observation"), false);
   assert.match(JSON.stringify(bundle), /History of depression/);
+});
+
+test("signed-out samples verify against their exact bytes and retired issuer keys verify legacy artifacts", async () => {
+  const { publicKey, activeKeyId, keys } = await (await request("/api/key")).json();
+  assert.equal(keys[activeKeyId], publicKey);
+  const { before, after, reference } = await (await request("/api/sample")).json();
+  const first = await verifyExportReceipt(before.receipt, Buffer.from(before.bundle), publicKey);
+  const second = await verifyExportReceipt(after.receipt, Buffer.from(after.bundle), publicKey);
+  assert.equal(first.receipt.referralId, reference);
+  assert.equal(second.receipt.referralId, reference);
+  assert.equal(first.receipt.sample, true);
+  assert.ok(first.matches && second.matches && first.receipt.exportedAt < second.receipt.exportedAt);
+  assert.equal((await verifyExportReceipt(before.receipt, Buffer.from(after.bundle), publicKey)).matches, false);
+  assert.match(before.bundle, /Please review the hemoglobin result/);
+  assert.doesNotMatch(after.bundle, /Please review the hemoglobin result/);
+
+  function previousToken(payload, domain = "") {
+    const wire = JSON.stringify(payload);
+    return Buffer.from(wire).toString("base64url") + "." + sign(null, Buffer.from(domain + wire), retired.privateKey).toString("base64url");
+  }
+  const { pass: { kid, ...issued } } = await (await request("/api/issue", draft)).json();
+  const oldQr = previousToken({ ...issued, v: 1 });
+  assert.equal((await request("/api/check", { token: oldQr, clinic: "north" })).status, 200);
+  const { kid: receiptKey, ...oldManifest } = first.receipt;
+  const oldReceipt = previousToken(oldManifest, exportReceiptDomain);
+  const legacyKey = await signedByIssuer(splitSignedToken(oldReceipt), keys, exportReceiptDomain);
+  assert.notEqual(legacyKey, publicKey);
+  assert.equal((await verifyExportReceipt(oldReceipt, Buffer.from(before.bundle), legacyKey)).matches, true);
 });

@@ -19,6 +19,7 @@
     <header class="intro">
       <h1>Verify a FHIR export</h1>
       <p>Select the FHIR bundle and its signed receipt. Verification checks both files in this browser.</p>
+      <p><a href="/demo.html#exports">Get a signed sample export</a></p>
     </header>
     <div class="verifier-layout">
       <form id="verify-export-form" class="verifier-card">
@@ -32,13 +33,23 @@
         <h2 id="verification-title">Verification result</h2>
         <p id="verification-status" role="status">Choose an export and its matching receipt.</p>
         <dl id="receipt-facts" class="metadata" hidden>
+          <div id="receipt-sample" hidden><dt>Source</dt><dd>Synthetic sample</dd></div>
+          <div><dt>Referral ID</dt><dd><bdi id="receipt-referral"></bdi></dd></div>
           <div><dt>Receiving clinic</dt><dd id="receipt-clinic"></dd></div>
           <div><dt>Export prepared</dt><dd id="receipt-time"></dd></div>
+          <div><dt>SHA-256 fingerprint</dt><dd><code id="receipt-hash"></code></dd></div>
         </dl>
+        <button id="import-referral" type="button" hidden>Import into simulated clinic queue</button>
         <button id="try-export-edit" class="secondary" type="button" hidden>Try changing a field</button>
         <p id="edit-result" role="status"></p>
       </section>
     </div>
+    <section class="verifier-card simulated-receiver" aria-labelledby="receiver-title">
+      <h2 id="receiver-title">Simulated clinic queue</h2>
+      <p>Import checks the referral document and its links against the signed receipt. The simulated queue stays in this browser tab.</p>
+      <p id="import-status" role="status">No referrals imported.</p>
+      <ul id="import-queue" hidden></ul>
+    </section>
   </main>
 </body>
 </html>
