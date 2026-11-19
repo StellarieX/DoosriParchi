@@ -108,7 +108,6 @@ export async function startMockSupabase() {
   const calls = [];
   const workspaceAccounts = new Map(accounts.map(account => [account.id, account]));
   const signups = new Map();
-  let nextToken = 1;
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, "http://localhost");
     const chunks = [];
@@ -134,7 +133,7 @@ export async function startMockSupabase() {
         const user = signup?.user ?? accounts.find(account => account.email === body.email);
         if (!user || body.password !== (signup?.password ?? "demo-password")) return send(400, { message: "Invalid credentials" });
         if (signup && !user.email_confirmed_at) return send(400, { error_code: "email_not_confirmed" });
-        const token = "test-token-" + nextToken++;
+        const token = "test-token-" + randomUUID();
         tokens.set(token, user);
         const { id, email, email_confirmed_at, app_metadata } = user;
         return send(200, { access_token: token, expires_in: 3600, user: { id, email, email_confirmed_at, app_metadata } });

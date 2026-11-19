@@ -63,13 +63,18 @@ function downloadFhir(pass, prefix) {
 
 function renderPreview() {
   const selected = disclosure(draft.fields, draft.cleaned);
-  const minimal = (issued?.pass.printMode ?? draft.printMode) === "minimal";
-  const items = issued?.pass.items ?? (minimal ? selected.filter(item => item.id === "result") : selected);
+  const mode = issued?.pass.printMode ?? draft.printMode;
+  const privateQr = mode === "private";
+  const items = issued?.pass.items ?? (privateQr ? [] : mode === "minimal" ? selected.filter(item => item.id === "result") : selected);
   byId("preview-items").innerHTML = entryMarkup(items, hasConflict(draft.fields, draft.cleaned)) ||
-    '<p class="muted">No clinical details are printed in this pass.</p>';
-  byId("online-preview").innerHTML = minimal
+    `<p class="muted">${privateQr ? "The QR contains a signed referral reference." : "The paper shows the patient’s name and receiving clinic."}</p>`;
+  byId("printed-patient").hidden = privateQr;
+  byId("online-preview").innerHTML = mode !== "full"
     ? '<section class="online-preview"><h3>Available to the signed-in clinic online</h3>' +
       entryMarkup(issued?.onlineItems ?? selected, hasConflict(draft.fields, draft.cleaned)) + '</section>' : "";
+  const hint = byId("print-mode-help");
+  if (hint) hint.textContent = privateQr ? "Scan online and sign in at the receiving clinic to view approved details."
+    : "Anyone with this copy can read the patient’s name and any lab result you selected.";
   byId("preview-clinic").textContent = clinics[draft.clinic];
   byId("sheet-status").textContent = issued ? "Signed pass" : "Draft preview";
 }
@@ -82,10 +87,13 @@ function previewControls() {
     <fieldset><legend>From your record</legend>${labels.map(([id, label, description]) =>
       `<label class="field"><input type="checkbox" value="${id}" ${draft.fields.includes(id) ? "checked" : ""}>
       <span><strong>${label}</strong><small>${description}</small></span></label>`).join("")}</fieldset>
-    <label class="label" for="print-mode">Information on the paper and QR</label>
-    <select id="print-mode"><option value="full" ${draft.printMode === "full" ? "selected" : ""}>All approved items</option>
-    <option value="minimal" ${draft.printMode === "minimal" ? "selected" : ""} ${!session.enabled || !session.user || session.user.clinic ? "disabled" : ""}>Lab result only; other items online</option></select>
-    <p class="muted mode-help">Anyone holding the paper or QR can read the printed items.</p>
+    ${session.enabled ? `<label class="label" for="print-mode">Information on the paper and QR</label>
+    <select id="print-mode" aria-describedby="print-mode-help">
+      <option value="private" ${draft.printMode === "private" ? "selected" : ""}>Private QR</option>
+      <option value="minimal" ${draft.printMode === "minimal" ? "selected" : ""}>Minimal offline copy</option>
+    </select>
+    <p class="muted mode-help" id="print-mode-help"></p>`
+      : '<p class="muted mode-help">Anyone with the paper or QR can read the included information.</p>'}
     <div id="conflict"></div>
     <div class="buttons"><button id="continue">Review consent</button></div>`;
 }
@@ -101,6 +109,11 @@ function updateConflict() {
 
 function readback() {
   const details = disclosure(draft.fields, draft.cleaned).map(item => item.text.replace(/\.$/, "")).join(". ");
+  const paperMessage = {
+    private: "The QR contains a referral reference. The receiving clinic signs in to see the approved details.",
+    minimal: "Anyone with the paper or QR can read the patient’s name and any selected lab result. The receiving clinic signs in for the other approved details.",
+    full: "Anyone who scans this QR code can read the included information."
+  };
   if (draft.language === "hi") {
     const has = id => draft.fields.includes(id);
     const recipient = draft.clinic === "north" ? "नॉर्थ क्लिनिक" : "साउथ क्लिनिक";
@@ -111,9 +124,14 @@ function readback() {
         ? "रेफ़रल नोट, जिसमें हीमोग्लोबिन की जाँच और अवसाद के इतिहास का उल्लेख है"
         : "रेफ़रल नोट, जिसमें अगली मुलाक़ात में हीमोग्लोबिन की जाँच करने की बात है")
     ].filter(Boolean);
-    return `आप ${recipient} के साथ आशा दास का रेफ़रल साझा कर रहे हैं। इसमें शामिल है: ${items.join(", ")}। ${draft.printMode === "minimal" ? "कागज़ और क्यूआर में केवल चुना हुआ लैब नतीजा है। बाकी स्वीकृत जानकारी क्लिनिक को साइन इन करने के बाद ऑनलाइन मिलेगी।" : "इस क्यूआर कोड को स्कैन करने वाला व्यक्ति यह जानकारी पढ़ सकता है।"}`;
+    const hindiPaperMessage = {
+      private: "क्यूआर में रेफ़रल का संदर्भ है। स्वीकृत जानकारी देखने के लिए प्राप्तकर्ता क्लिनिक को साइन इन करना होगा।",
+      minimal: "कागज़ और क्यूआर पर मरीज़ का नाम और चुना हुआ लैब नतीजा पढ़ा जा सकता है। बाकी स्वीकृत जानकारी क्लिनिक को साइन इन करने के बाद मिलेगी।",
+      full: "इस क्यूआर कोड को स्कैन करने वाला व्यक्ति यह जानकारी पढ़ सकता है।"
+    };
+    return `आप ${recipient} के साथ आशा दास का रेफ़रल साझा कर रहे हैं। इसमें शामिल है: ${items.join(", ")}। ${hindiPaperMessage[draft.printMode]}`;
   }
-  return `You are sharing Asha Das’s referral with ${clinics[draft.clinic]}. It includes ${details}. ${draft.printMode === "minimal" ? "The paper and QR include only the lab result if selected. Other approved items are available online after the receiving clinic signs in." : "Anyone who scans this QR code can read the included information."}`;
+  return `You are sharing Asha Das’s referral with ${clinics[draft.clinic]}. It includes ${details}. ${paperMessage[draft.printMode]}`;
 }
 
 function consentControls() {
@@ -201,7 +219,7 @@ byId("patient-step").addEventListener("click", event => {
       issued = undefined;
       draft.fields = [...defaultSelection];
       draft.cleaned = false;
-      draft.printMode = "full";
+      draft.printMode = session.enabled ? "private" : "full";
       goTo(0);
       break;
   }
@@ -284,29 +302,33 @@ function showVerified(pass) {
   const queued = session.user?.clinic && outbox().find(item => item.id === pass.id);
   const online = Boolean(session.user?.clinic && navigator.onLine);
   const onlineItems = online ? activePass?.onlineItems : undefined;
+  const privateQr = pass.printMode === "private";
+  const locked = privateQr && !onlineItems;
+  const patient = pass.patient ?? (onlineItems ? activePass?.onlinePatient : undefined);
   const items = onlineItems ?? pass.items;
   const note = items.find(item => item.id === "note");
   const checkedAt = activePass?.checkedAt;
   const accept = !session.enabled ? "" : accepted
     ? '<p class="accepted-state">Accepted into clinic intake. The patient can see this receipt.</p>'
     : queued ? '<p class="accepted-state">' + (queued.failed ? 'Acceptance failed. Review the saved intake below.' : 'Saved on this device. Acceptance will sync when connected.') + '</p>'
-    : '<button id="accept">Accept referral</button>';
-  const restricted = online ? `<button class="secondary" id="load-details">${onlineItems ? "Reload" : "Load"} patient-approved details</button>` : "";
+    : locked ? "" : '<button id="accept">Accept referral</button>';
+  const restricted = online ? `<button ${locked ? "" : 'class="secondary"'} id="load-details">${onlineItems ? "Reload" : "Load"} patient-approved details</button>` : "";
   const content = `<div class="sheet-head"><span>${safe(pass.issuer)}</span><span>Signed referral</span></div>
     <h2>Follow-up referral</h2><p><span class="verified-tag">Signature verified</span></p>
     <dl class="metadata">
-      <div><dt>Patient</dt><dd>${safe(pass.patient)}</dd></div>
+      ${patient ? `<div><dt>Patient</dt><dd>${safe(patient)}</dd></div>` : ""}
       <div><dt>Prepared for</dt><dd>${safe(clinics[pass.clinic])}</dd></div>
       <div><dt>Issued</dt><dd>${safe(formatDate(pass.issued))}</dd></div>
       <div><dt>Expires</dt><dd>${safe(formatDate(pass.expires))}</dd></div>
     </dl>
-    <p class="sheet-source">${onlineItems ? "Patient-approved online details" : "Details from the signed QR"}</p>
-    <section class="referral-action"><h3>Reason and next action</h3><p>${note ? safe(note.text) : "Follow-up consultation. Review the available referral information with the patient."}</p></section>
-    ${entryMarkup(items.filter(item => item.id !== "note"))}
+    ${locked ? '<p class="sheet-source">Private referral reference</p><p class="muted">Connect and sign in at the receiving clinic to open patient-approved details.</p>' : `
+      <p class="sheet-source">${onlineItems ? "Patient-approved online details" : "Details from the signed QR"}</p>
+      <section class="referral-action"><h3>Reason and next action</h3><p>${note ? safe(note.text) : "Follow-up consultation. Review the available referral information with the patient."}</p></section>
+      ${entryMarkup(items.filter(item => item.id !== "note"))}`}
     ${accept}
     <p class="sheet-foot">${checkedAt ? "Issuer confirmed at " + safe(formatDate(checkedAt)) + "." : "Verified on this device. Issuer status has yet to be checked."}</p>
-    <div class="buttons"><button class="secondary" id="check-online" ${navigator.onLine ? "" : "disabled"}>Check with issuer</button>
-    <button class="secondary" id="export">${online ? "Download current FHIR bundle" : "Download printed items only (FHIR)"}</button>${restricted}
+    <div class="buttons">${restricted}<button class="secondary" id="check-online" ${navigator.onLine ? "" : "disabled"}>Check with issuer</button>
+    ${locked ? "" : `<button class="secondary" id="export">${online ? "Download current FHIR bundle" : "Download printed items only (FHIR)"}</button>`}
     ${accepted ? '<button class="secondary" id="open-accepted">Open clinic intake</button>' : ""}</div>`;
   if (activePass.markup === content) return;
   activePass.markup = content;
@@ -387,9 +409,10 @@ byId("verified").addEventListener("click", async event => {
   if (event.target.id === "load-details") {
     event.target.disabled = true;
     try {
-      const { items } = await api("details", { token: current.token, purpose: "view" });
+      const { items, patient } = await api("details", { token: current.token, purpose: "view" });
       if (current === activePass && navigator.onLine) {
         current.onlineItems = items;
+        current.onlinePatient = patient;
         showVerified(current.pass);
         message("clinic-message", "Loaded the items approved by the patient.");
       }
@@ -650,7 +673,8 @@ function patientLedger(review, clinic, expired, online) {
   const canWithdraw = hasOnlineNote && !review.withdrawn && !expired;
   const legacy = review.printMode === "unknown";
   const paperSummary = legacy ? "This older pass predates print tracking. Its original contents may already be on paper."
-    : printed.size ? "Anyone with the paper or QR can read the items marked below." : "This QR contains no clinical items.";
+    : review.printMode === "private" ? "The QR carries the referral reference. The clinic signs in to see the approved details."
+      : printed.size ? "Anyone with the paper or QR can read the items marked below." : "The QR shows the patient’s name and receiving clinic.";
   return `<section class="consent-ledger" aria-label="Shared information">
     <h3>What you shared with ${safe(clinic)}</h3>
     <p class="muted ledger-help">${paperSummary}</p>
@@ -892,7 +916,7 @@ byId("account-summary").addEventListener("click", async event => {
     issued = undefined;
     referrals = [];
     step = 0;
-    draft.printMode = "full";
+    draft.printMode = "private";
     renderStep();
     message("account-message");
   } catch (error) {
@@ -951,7 +975,7 @@ function reissueFromReview(selected) {
   Object.assign(draft, {
     clinic: row.clinic, fields: items.map(item => item.id),
     cleaned: items.find(item => item.id === "note")?.text === disclosure(["note"], true)[0].text,
-    printMode: review.printMode === "full" ? "full" : "minimal"
+    printMode: review.printMode === "minimal" ? "minimal" : "private"
   });
   issued = undefined;
   closeActivity();
@@ -1029,7 +1053,7 @@ window.addEventListener("referral-account", () => {
     clearVerified();
     issued = undefined;
     step = 0;
-    draft.printMode = "full";
+    draft.printMode = session.enabled ? "private" : "full";
   }
   activeAccountId = session.user?.id;
   renderAccount();
@@ -1058,6 +1082,7 @@ window.addEventListener("online", checkSession);
 window.addEventListener("offline", () => {
   if (activePass) {
     delete activePass.onlineItems;
+    delete activePass.onlinePatient;
     showVerified(activePass.pass);
   }
   if (selectedReferral) {

@@ -55,15 +55,16 @@ async function bodyOf(req) {
   return data;
 }
 
-async function issue({ clinic, fields, cleaned, answer, language, printMode = "full" }, user) {
+async function issue({ clinic, fields, cleaned, answer, language, printMode }, user) {
+  if (printMode === undefined) printMode = user ? "private" : "full";
   if (!Object.hasOwn(clinics, clinic) || typeof cleaned !== "boolean" ||
       !Array.isArray(fields) || fields.length < 1 || fields.length > 3 ||
       new Set(fields).size !== fields.length ||
       fields.some(field => !["result", "history", "note"].includes(field)) ||
-      !["en", "hi"].includes(language) || !["full", "minimal"].includes(printMode)) {
+      !["en", "hi"].includes(language) || !["private", "minimal", "full"].includes(printMode)) {
     throw new RequestError(400, "Choose a clinic, language and valid referral contents.");
   }
-  if (printMode === "minimal" && !user) throw new RequestError(422, "Sign in to share restricted details online.");
+  if (printMode !== "full" && !user) throw new RequestError(422, "Sign in to share restricted details online.");
   if (hasConflict(fields, cleaned)) {
     throw new RequestError(422, "Resolve the private information repeated in the referral note.");
   }
@@ -73,15 +74,16 @@ async function issue({ clinic, fields, cleaned, answer, language, printMode = "f
   const issued = Date.now();
   const id = randomUUID();
   const items = disclosure(fields, cleaned);
-  const paperItems = printMode === "minimal" ? items.filter(item => item.id === "result") : items;
+  const paperItems = printMode === "private" ? [] : printMode === "minimal" ? items.filter(item => item.id === "result") : items;
   const pass = referralPass(id, clinic, issued, issued + passLifetime, printMode, paperItems);
   const signed = await signedQr(pass);
   if (user) await registerPass(pass, items, user);
-  return { ...signed, ...(printMode === "minimal" && { onlineItems: items }) };
+  return { ...signed, ...(printMode !== "full" && { onlineItems: items }) };
 }
 
 function referralPass(id, clinic, issued, expires, printMode, items) {
-  return { v: 1, id, issuer: "Cedar Health", clinic, issued, expires, printMode, patient: "Asha Das", items };
+  return { v: 1, id, issuer: "Cedar Health", clinic, issued, expires, printMode,
+    ...(printMode !== "private" && { patient: "Asha Das" }), items };
 }
 
 async function signedQr(pass) {
@@ -130,12 +132,13 @@ async function recover({ id }, user) {
   if (!row) throw new RequestError(404, "The issuer could not find this referral.");
   const expires = Date.parse(row.expires_at);
   if (expires <= Date.now()) throw new RequestError(410, "This QR expired. Review a fresh referral to share again.");
-  if (!["full", "minimal"].includes(row.print_mode) || !Array.isArray(row.paper_ids) || !Array.isArray(row.items)) {
+  if (!["private", "minimal", "full"].includes(row.print_mode) || !Array.isArray(row.paper_ids) || !Array.isArray(row.items)) {
     throw new RequestError(409, "This referral predates QR recovery. Review a fresh referral to share again.");
   }
   // Restore the original item order and key order after the JSONB round trip.
   const items = row.paper_ids.map(paperId => row.items.find(item => item.id === paperId));
-  if (items.some(item => !item || (row.print_mode === "minimal" && item.id !== "result"))) {
+  if ((row.print_mode === "private" && items.length) ||
+      items.some(item => !item || (row.print_mode === "minimal" && item.id !== "result"))) {
     throw new RequestError(409, "The printed contents could not be recovered. Review a fresh referral to share again.");
   }
   const paper = items.map(({ id, label, text }) => ({ id, label, text }));
@@ -226,7 +229,8 @@ export async function handleApi(req, res, path) {
       }
       if (token !== undefined) {
         const pass = checkedPass({ token, clinic: user.clinic });
-        return send(res, 200, await loadDetails(pass.id, user, true, purpose));
+        const details = await loadDetails(pass.id, user, true, purpose);
+        return send(res, 200, pass.printMode === "private" ? { ...details, patient: "Asha Das" } : details);
       }
       checkReferralId(id);
       return send(res, 200, await loadDetails(id, user, false, purpose));

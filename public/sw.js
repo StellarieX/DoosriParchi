@@ -1,4 +1,4 @@
-const cacheName = "doosriparchi-shell-v10";
+const cacheName = "doosriparchi-shell-v12";
 const shell = ["/", "/style.css", "/app.mjs", "/case.mjs", "/sync-client.mjs", "/jsqr.js"];
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(cacheName).then(cache => cache.addAll(shell)).then(() => self.skipWaiting()));

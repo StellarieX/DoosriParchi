@@ -168,6 +168,26 @@ test("QR recovery recreates the original paper pass and stays scoped to its pati
   assert.equal((await owner.request("/api/recover", { id })).status, 410);
 });
 
+test("the default signed-in QR exposes a reference while only the receiving clinic loads approved details", async () => {
+  const [patient, north, south, visitor] = Array.from({ length: 4 }, () => device());
+  await Promise.all([patient.login("patient@example.test"), north.login("north@example.test"), south.login("south@example.test")]);
+  const issued = await patient.read("/api/issue", { ...draft, printMode: undefined });
+  const { pass, token, qr } = issued;
+  const payload = JSON.parse(Buffer.from(token.split(".")[0], "base64url"));
+  assert.equal(payload.printMode, "private");
+  assert.deepEqual(payload.items, []);
+  assert.deepEqual(Object.keys(payload), ["v", "id", "issuer", "clinic", "issued", "expires", "printMode", "items"]);
+  assert.deepEqual(database.rows.get(pass.id).paper_ids, []);
+  assert.equal((await visitor.request("/api/details", { token })).status, 401);
+  assert.equal((await south.request("/api/details", { token })).status, 403);
+  assert.equal((await patient.request("/api/details", { token })).status, 403);
+  assert.equal((await north.request("/api/details", { id: pass.id })).status, 409);
+  assert.deepEqual(await north.read("/api/details", { token }), { items: disclosure(draft.fields, draft.cleaned), patient: "Asha Das" });
+  await patient.manage(pass.id, "withdraw");
+  assert.deepEqual(await north.details({ token }), disclosure(["result"], true));
+  assert.deepEqual(await patient.read("/api/recover", { id: pass.id }), { pass, token, qr });
+});
+
 test("appointments require intake, preserve clinic boundaries and reject stale confirmations", async () => {
   const [patient, north, south, other] = Array.from({ length: 4 }, () => device());
   await Promise.all([patient.login("patient@example.test"), north.login("north@example.test"),
