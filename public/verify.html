@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#12352f">
+  <title>Verify export | DoosriParchi</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/export-verifier.mjs"></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="mast-inner">
+      <a class="brand" href="/"><span class="mark" aria-hidden="true"></span>DoosriParchi</a>
+      <nav aria-label="Workspace"><a href="/">Referral workspace</a><a href="/verify.html" aria-current="page">Verify export</a></nav>
+    </div>
+  </header>
+  <main class="verifier-page">
+    <header class="intro">
+      <h1>Verify a FHIR export</h1>
+      <p>Select the FHIR bundle and its signed receipt. Verification checks both files in this browser.</p>
+    </header>
+    <div class="verifier-layout">
+      <form id="verify-export-form" class="verifier-card">
+        <label for="export-file">FHIR bundle</label>
+        <input id="export-file" type="file" accept=".json,application/fhir+json" required>
+        <label for="receipt-file">Signed receipt</label>
+        <input id="receipt-file" type="file" accept=".json,application/json" required>
+        <button type="submit">Verify export</button>
+      </form>
+      <section class="verifier-card" id="verification-result" aria-labelledby="verification-title">
+        <h2 id="verification-title">Verification result</h2>
+        <p id="verification-status" role="status">Choose an export and its matching receipt.</p>
+        <dl id="receipt-facts" class="metadata" hidden>
+          <div><dt>Receiving clinic</dt><dd id="receipt-clinic"></dd></div>
+          <div><dt>Export prepared</dt><dd id="receipt-time"></dd></div>
+        </dl>
+        <button id="try-export-edit" class="secondary" type="button" hidden>Try changing a field</button>
+        <p id="edit-result" role="status"></p>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

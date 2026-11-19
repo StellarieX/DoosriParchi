@@ -143,7 +143,7 @@ video { width: 100%; margin-top: 14px; border-radius: 4px; background: var(--ink
   body { display: block; }
   .mast-inner { padding: 0 14px; height: auto; min-height: 56px; gap: 12px; flex-direction: row; justify-content: space-between; align-items: center; }
   .brand { padding-left: 0; font-size: .88rem; }
-  nav { flex-direction: row; gap: 3px; }
+  nav { flex-direction: row; justify-content: flex-end; flex-wrap: wrap; gap: 3px; }
   nav a { font-size: .76rem; padding-inline: 7px; }
   .demo { display: none; }
 }
@@ -290,8 +290,25 @@ video { width: 100%; margin-top: 14px; border-radius: 4px; background: var(--ink
 .activity-timeline li:last-child { padding-bottom: 0; }
 .activity-timeline time, .activity-timeline small { font-size: .77rem; color: var(--muted); }
 .activity-timeline strong { font-weight: 600; font-size: .88rem; }
+.receipt-link { width: fit-content; color: var(--accent); font-size: .82rem; font-weight: 650; text-underline-offset: 3px; }
+.export-receipt { margin-bottom: 0; }
+.verifier-page { max-width: 1000px; }
+.verifier-layout { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; align-items: start; }
+.verifier-card { display: grid; gap: 12px; padding: clamp(18px, 3vw, 30px); border: 1px solid var(--line); border-radius: 12px; background: var(--paper); }
+.verifier-card label { font-size: .87rem; font-weight: 650; }
+.verifier-card input { width: 100%; min-width: 0; color: var(--muted); font: inherit; font-size: .85rem; }
+.verifier-card input::file-selector-button { margin-right: 8px; padding: 7px 10px; border: 1px solid var(--control); border-radius: 5px; background: var(--mint); color: var(--ink); cursor: pointer; }
+.verifier-card button { justify-self: start; }
+.verifier-card p, .verifier-card .metadata { margin: 0; }
+.verifier-card p:empty { display: none; }
+.verifier-card[data-state="verified"] { background: var(--mint); border-color: #78a797; }
+.verifier-card[data-state="error"], #edit-result:not(:empty) { background: #f8f2e2; color: #513c18; }
+#edit-result:not(:empty) { padding: 9px 11px; border-radius: 5px; font-size: .9rem; }
 .detail-offline { color: #6a4b17; }
 @media(max-width: 800px) {
   .activity-columns { grid-template-columns: 1fr; }
   .activity-timeline { padding-top: 16px; border-top: 1px solid var(--line); }
+}
+@media (max-width: 720px) {
+  .verifier-layout { grid-template-columns: minmax(0, 1fr); }
 }

@@ -25,9 +25,10 @@ function referralDetails(row, account, { signed_pass, access_purpose }) {
   if (!row || row.clinic !== account.clinic) return error(404, "Referral unavailable.");
   if (expired(row)) return error(410, "Referral expired.");
   if (!signed_pass && !row.accepted_at) return error(409, "Accept the referral first.");
-  if (!["view", "export"].includes(access_purpose)) return error(400, "Choose an access purpose.");
+  if (!["view", "export", "prepare_export"].includes(access_purpose)) return error(400, "Choose an access purpose.");
   const items = row.items.filter(item => item.id !== "note" || !row.withdrawn);
   if (row.request?.status === "approved") items.push(previousResult);
+  if (access_purpose === "prepare_export") return { items, issuedAt: row.issued_at };
   addEvent(row, access_purpose, items.map(item => item.id));
   return { items };
 }
@@ -193,6 +194,15 @@ export async function startMockSupabase() {
       if (url.pathname === "/rest/v1/rpc/referral_details") {
         const account = workspaceAccounts.get(body.staff_user);
         return send(200, referralDetails(rows.get(body.referral_id), account, body));
+      }
+      if (url.pathname === "/rest/v1/rpc/record_referral_export") {
+        const row = rows.get(body.referral_id);
+        const account = workspaceAccounts.get(body.staff_user);
+        const snapshot = referralDetails(row, account, { ...body, access_purpose: "prepare_export" });
+        if (snapshot.status) return send(200, snapshot);
+        if (JSON.stringify(snapshot.items) !== JSON.stringify(body.expected_items)) return send(200, error(409, "Sharing changed during export."));
+        row.events.push({ kind: "export", at: new Date().toISOString(), itemIds: snapshot.items.map(item => item.id), receipt: body.signed_receipt });
+        return send(200, { recorded: true });
       }
       if (url.pathname === "/rest/v1/rpc/manage_referral") {
         const account = workspaceAccounts.get(body.actor_user);

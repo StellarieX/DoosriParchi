@@ -1,5 +1,6 @@
 import { clinics, defaultSelection, disclosure, hasConflict, toFhir } from "./case.mjs";
 import { session, sessionReady, request as api, loadSession, login, logout, outbox, queueAcceptance, flushOutbox, discardQueued } from "./sync-client.mjs";
+import { receiptDocument } from "./export-receipt.mjs";
 
 const byId = id => document.getElementById(id);
 const draft = { clinic: "north", fields: [...defaultSelection], cleaned: false, language: "en", printMode: "full" };
@@ -51,14 +52,23 @@ function replacePreservingFocus(node, content) {
   if (focused) (byId(focused) ?? node.querySelector("[tabindex='-1']"))?.focus({ preventScroll: true });
 }
 
-function downloadFhir(pass, prefix) {
-  const file = new Blob([JSON.stringify(toFhir(pass), null, 2)], { type: "application/fhir+json" });
+function downloadFhir(bundle, name) {
+  const file = new Blob([bundle], { type: "application/fhir+json" });
   const url = URL.createObjectURL(file);
   const link = document.createElement("a");
   link.href = url;
-  link.download = prefix + "-" + pass.id + ".json";
+  link.download = name;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+function exportName(receipt) {
+  return "doosriparchi-export-" + receipt.split(".")[1].slice(0, 8);
+}
+
+function receiptLink(receipt) {
+  const href = "data:application/json;charset=utf-8," + encodeURIComponent(receiptDocument(receipt));
+  return `<a class="receipt-link" href="${safe(href)}" download="${safe(exportName(receipt))}.receipt.json">Save signed receipt</a>`;
 }
 
 function renderPreview() {
@@ -329,7 +339,8 @@ function showVerified(pass) {
     <p class="sheet-foot">${checkedAt ? "Issuer confirmed at " + safe(formatDate(checkedAt)) + "." : "Verified on this device. Issuer status has yet to be checked."}</p>
     <div class="buttons">${restricted}<button class="secondary" id="check-online" ${navigator.onLine ? "" : "disabled"}>Check with issuer</button>
     ${locked ? "" : `<button class="secondary" id="export">${online ? "Download current FHIR bundle" : "Download printed items only (FHIR)"}</button>`}
-    ${accepted ? '<button class="secondary" id="open-accepted">Open clinic intake</button>' : ""}</div>`;
+    ${accepted ? '<button class="secondary" id="open-accepted">Open clinic intake</button>' : ""}</div>
+    ${activePass.exportReceipt ? `<p class="export-receipt">${receiptLink(activePass.exportReceipt)}</p>` : ""}`;
   if (activePass.markup === content) return;
   activePass.markup = content;
   replacePreservingFocus(byId("verified"), content);
@@ -384,10 +395,17 @@ byId("verified").addEventListener("click", async event => {
     event.target.disabled = true;
     try {
       const online = Boolean(session.user?.clinic && navigator.onLine);
-      const { items } = online ? await api("details", { token: current.token, purpose: "export" }) : current.pass;
+      const exported = online ? await api("details", { token: current.token, purpose: "export" }) : null;
       if (current !== activePass) return;
-      downloadFhir({ ...current.pass, items }, "referral");
-      message("clinic-message", online ? "Downloaded current patient-approved items." : "Downloaded the items printed in the signed QR.");
+      if (exported) {
+        downloadFhir(exported.bundle, exportName(exported.receipt) + ".fhir.json");
+        current.exportReceipt = exported.receipt;
+        showVerified(current.pass);
+        message("clinic-message", "FHIR bundle downloaded. Save its signed receipt to verify it later.");
+      } else {
+        downloadFhir(JSON.stringify(toFhir(current.pass), null, 2), "referral-" + current.pass.id + ".json");
+        message("clinic-message", "Downloaded the items printed in the signed QR. Connect for a signed export receipt.");
+      }
     } catch (error) {
       if (current === activePass) message("clinic-message", error instanceof TypeError ? "Connect to download current patient-approved items." : error.message, true);
     } finally {
@@ -662,7 +680,8 @@ function timelineMarkup(review, clinic, isClinic) {
     const items = event.itemIds?.map(id => recordLabels[id]).filter(Boolean).join(", ");
     return `<li><strong>${safe(titles[event.kind] ?? "Referral updated")}</strong>
       <time datetime="${safe(new Date(event.at).toISOString())}">${safe(eventTime.format(new Date(event.at)))}</time>
-      ${items && ["view", "export"].includes(event.kind) ? `<small>${safe(items)}</small>` : ""}</li>`;
+      ${items && ["view", "export"].includes(event.kind) ? `<small>${safe(items)}</small>` : ""}
+      ${event.receipt ? receiptLink(event.receipt) : ""}</li>`;
   }).join("")}</ol></section>`;
 }
 
@@ -727,7 +746,8 @@ function clinicLedger(selected, expired, online) {
     ${selected.items ? entryMarkup(selected.items) || '<p class="muted">No clinical details are currently available online.</p>' :
       '<p class="muted">Open the items Asha currently allows this clinic to see.</p>'}
     ${!expired ? `<div class="buttons"><button id="view-intake" ${online ? "" : "disabled"}>${selected.items ? "Reload" : "Open"} online details</button>
-      <button class="secondary" id="export-intake" ${online ? "" : "disabled"}>Download current FHIR bundle</button></div>` : '<p class="muted">This referral has expired.</p>'}</section>`;
+      <button class="secondary" id="export-intake" ${online ? "" : "disabled"}>Download current FHIR bundle</button></div>` : '<p class="muted">This referral has expired.</p>'}
+    ${selected.exportReceipt ? `<p class="export-receipt">${receiptLink(selected.exportReceipt)}</p>` : ""}</section>`;
 }
 
 function renderActivityDetail() {
@@ -1015,14 +1035,16 @@ byId("activity-detail").addEventListener("click", async event => {
   const selected = selectedReferral;
   await detailAction(selected, async () => {
     const purpose = button.id === "view-intake" ? "view" : "export";
-    const { items } = await api("details", { id: selected.row.id, purpose });
+    const details = await api("details", { id: selected.row.id, purpose });
     if (selected !== selectedReferral || !navigator.onLine) return;
     if (purpose === "view") {
-      selected.items = items;
-      renderActivityDetail();
+      selected.items = details.items;
     } else {
-      downloadFhir({ id: selected.row.id, issued: Date.parse(selected.row.issued_at), items }, "intake");
+      downloadFhir(details.bundle, exportName(details.receipt) + ".fhir.json");
+      selected.exportReceipt = details.receipt;
+      message("detail-message", "FHIR bundle downloaded. Save its signed receipt to verify it later.");
     }
+    renderActivityDetail();
   });
   await refreshReview(selected);
 });

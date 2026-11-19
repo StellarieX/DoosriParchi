@@ -147,6 +147,12 @@ export function loadDetails(id, user, signedPass, purpose) {
   });
 }
 
+export function recordExport(id, user, signedPass, items, receipt) {
+  return referralAction("record_referral_export", {
+    referral_id: id, staff_user: user.id, signed_pass: signedPass, expected_items: items, signed_receipt: receipt
+  });
+}
+
 export function manageReferral(id, user, action, reason) {
   return referralAction("manage_referral", {
     referral_id: id, actor_user: user.id, manage_action: action, request_reason: reason

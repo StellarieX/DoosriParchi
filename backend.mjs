@@ -1,9 +1,10 @@
-import { createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sign, verify } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sign, verify } from "node:crypto";
 import qrcode from "qrcode";
-import { clinics, disclosure, hasConflict } from "./public/case.mjs";
+import { clinics, disclosure, hasConflict, toFhir } from "./public/case.mjs";
+import { exportReceiptDomain } from "./public/export-receipt.mjs";
 import {
   RequestError, syncEnabled, signIn, signUp, signOut, userFor, registerPass, recordAcceptance, listReferrals, loadDetails,
-  manageReferral, patientReferral, changeAppointment
+  manageReferral, patientReferral, changeAppointment, recordExport
 } from "./sync.mjs";
 
 const production = process.env.NODE_ENV === "production";
@@ -104,6 +105,9 @@ function checkedPass({ token, clinic }, allowExpired = false) {
     throw new RequestError(422, "The referral signature could not be verified.");
   }
   const pass = JSON.parse(Buffer.from(payload, "base64url"));
+  if (pass.v !== 1 || typeof pass.id !== "string" || !Number.isFinite(pass.expires) || !Array.isArray(pass.items)) {
+    throw new RequestError(422, "The referral format could not be verified.");
+  }
   if (pass.clinic !== clinic) throw new RequestError(403, "This pass is addressed to another clinic.");
   if (!allowExpired && pass.expires <= Date.now()) throw new RequestError(410, "This referral has expired.");
   return pass;
@@ -182,6 +186,22 @@ async function manage({ id, action, reason }, user) {
   return manageReferral(id, user, action, action === "request" ? reason : null);
 }
 
+async function exportReferral(id, user, signedPass) {
+  const { items, issuedAt } = await loadDetails(id, user, signedPass, "prepare_export");
+  const bundle = JSON.stringify(toFhir({ id, issued: Date.parse(issuedAt), items }), null, 2);
+  const exportedAt = new Date().toISOString();
+  const manifest = {
+    v: 1, kind: "fhir-export", receiptId: randomUUID(), referralId: id, clinic: user.clinic, exportedAt,
+    sha256: createHash("sha256").update(bundle, "utf8").digest("hex")
+  };
+  const payload = JSON.stringify(manifest);
+  const signature = sign(null, Buffer.from(exportReceiptDomain + payload), privateKey).toString("base64url");
+  const receipt = Buffer.from(payload).toString("base64url") + "." + signature;
+  const { recorded } = await recordExport(id, user, signedPass, items, receipt);
+  if (!recorded) throw new RequestError(503, "The export receipt could not be saved. Try again.");
+  return { items, bundle, receipt };
+}
+
 export async function handleApi(req, res, path) {
   try {
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -229,11 +249,11 @@ export async function handleApi(req, res, path) {
       }
       if (token !== undefined) {
         const pass = checkedPass({ token, clinic: user.clinic });
-        const details = await loadDetails(pass.id, user, true, purpose);
+        const details = purpose === "export" ? await exportReferral(pass.id, user, true) : await loadDetails(pass.id, user, true, "view");
         return send(res, 200, pass.printMode === "private" ? { ...details, patient: "Asha Das" } : details);
       }
       checkReferralId(id);
-      return send(res, 200, await loadDetails(id, user, false, purpose));
+      return send(res, 200, purpose === "export" ? await exportReferral(id, user, false) : await loadDetails(id, user, false, "view"));
     }
     const pass = checkedPass({ token: data.token, clinic: user.clinic }, path === "/api/accept");
     if (path === "/api/accept") return send(res, 200, { receipt: await recordAcceptance(pass, user) });

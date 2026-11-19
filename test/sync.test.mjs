@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { after, before, test } from "node:test";
 import { disclosure, toFhir } from "../public/case.mjs";
+import { verifyExportReceipt } from "../public/export-receipt.mjs";
 import { startMockSupabase, mockPublishableKey, mockSecretKey } from "./fixtures/supabase.mjs";
 
 let server;
@@ -186,6 +187,41 @@ test("the default signed-in QR exposes a reference while only the receiving clin
   await patient.manage(pass.id, "withdraw");
   assert.deepEqual(await north.details({ token }), disclosure(["result"], true));
   assert.deepEqual(await patient.read("/api/recover", { id: pass.id }), { pass, token, qr });
+});
+
+test("signed export receipts bind exact FHIR bytes and follow the patient’s disclosure history", async () => {
+  const patient = device(), clinic = device(), other = device();
+  await Promise.all([patient.login("patient@example.test"), clinic.login("north@example.test"), other.login("patient2@example.test")]);
+  const { pass: { id }, token } = await patient.read("/api/issue", { ...draft, printMode: "private" });
+  const { publicKey } = await device().read("/api/key");
+  assert.equal((await clinic.request("/api/details", { id, purpose: "export" })).status, 409);
+  const first = await clinic.read("/api/details", { token, purpose: "export" });
+  const verify = (exported, bundle = exported.bundle) => verifyExportReceipt(exported.receipt, Buffer.from(bundle), publicKey);
+  const original = await verify(first);
+  assert.equal(original.matches, true);
+  assert.equal(original.receipt.clinic, "north");
+  assert.equal(original.receipt.referralId, id);
+  assert.match(first.bundle, /Please review the hemoglobin result/);
+  assert.equal((await verify(first, first.bundle.replace('"status": "active"', '"status": "revoked"'))).matches, false);
+  const [payload, signature] = first.receipt.split(".");
+  const changedPayload = Buffer.from(JSON.stringify({ ...original.receipt, clinic: "south" })).toString("base64url");
+  await assert.rejects(verifyExportReceipt(changedPayload + "." + signature, Buffer.from(first.bundle), publicKey), /signature/);
+  assert.ok(payload);
+  assert.equal((await clinic.request("/api/check", { token: first.receipt })).status, 422);
+  assert.equal((await other.request("/api/manage", { id, action: "review" })).status, 404);
+
+  await patient.manage(id, "withdraw");
+  await clinic.read("/api/accept", { token });
+  const second = await clinic.read("/api/details", { id, purpose: "export" });
+  assert.doesNotMatch(second.bundle, /Please review the hemoglobin result/);
+  assert.equal((await verify(second)).matches, true);
+  assert.equal((await verify(first, second.bundle)).matches, false);
+  assert.equal((await verify(first)).matches, true);
+  const review = await patient.manage(id, "review");
+  assert.deepEqual(review.events.filter(event => event.kind === "export").map(({ itemIds, receipt }) => ({ itemIds, receipt })), [
+    { itemIds: ["result", "note"], receipt: first.receipt },
+    { itemIds: ["result"], receipt: second.receipt }
+  ]);
 });
 
 test("appointments require intake, preserve clinic boundaries and reject stale confirmations", async () => {
