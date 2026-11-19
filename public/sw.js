@@ -1,4 +1,4 @@
-const cacheName = "doosriparchi-shell-v13";
+const cacheName = "doosriparchi-shell-v14";
 const shell = ["/", "/style.css", "/app.mjs", "/case.mjs", "/sync-client.mjs", "/jsqr.js",
   "/verify.html", "/export-receipt.mjs", "/export-verifier.mjs"];
 self.addEventListener("install", event => {

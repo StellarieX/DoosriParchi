@@ -14,8 +14,9 @@
     <div class="mast-inner">
       <a class="brand" href="#patient"><span class="mark" aria-hidden="true"></span>DoosriParchi</a>
       <nav aria-label="Workspace">
-        <a href="#patient" id="patient-link" hidden>Patient</a>
-        <a href="#clinic" id="clinic-link" hidden>Receiving clinic</a>
+        <a href="#patient" id="patient-link" hidden>Send referral</a>
+        <a href="#clinic" id="clinic-link" hidden>Scan referral</a>
+        <a href="#activity" id="activity-link" hidden>Your referrals</a>
         <a href="/verify.html" target="_blank" rel="noopener">Verify export</a>
       </nav>
       <span class="demo">Synthetic case</span>
@@ -87,13 +88,15 @@
     </section>
     <section id="clinic" hidden>
       <div class="intro">
-        <h1>Verify a referral</h1>
+        <h1>Scan a referral</h1>
         <p>Scan the patient’s QR code or open a saved QR image.</p>
       </div>
       <div class="layout clinic-layout">
         <section class="controls" aria-label="Referral scanner">
-          <label class="label" for="clinic-choice">Receiving clinic</label>
-          <select id="clinic-choice"><option value="north">North Clinic</option><option value="south">South Clinic</option></select>
+          <div id="clinic-selection">
+            <label class="label" for="clinic-choice">Receiving clinic</label>
+            <select id="clinic-choice"><option value="north">North Clinic</option><option value="south">South Clinic</option></select>
+          </div>
           <p id="offline-ready" class="muted" role="status">Preparing offline verification…</p>
           <div class="buttons">
             <button type="button" id="camera">Use camera</button>
@@ -111,16 +114,22 @@
           </details>
           <p id="clinic-message" class="message" role="status"></p>
         </section>
-        <div class="document-tray">
-          <section class="sheet" id="verified" aria-live="polite"><h2>Referral details</h2><p class="muted">A verified referral will appear here.</p></section>
+        <div class="document-tray" id="scan-result" hidden>
+          <section class="sheet" id="verified" aria-live="polite"></section>
         </div>
       </div>
     </section>
-    <section id="sync-section" class="sync-section" hidden aria-label="Referral activity">
-      <div class="sync-heading"><h2 id="sync-heading">Referral activity</h2><button class="secondary" id="retry-sync">Refresh and retry</button></div>
+    <section id="sync-section" hidden aria-label="Referral activity">
+      <header class="intro sync-heading">
+        <h1 id="sync-heading" tabindex="-1">Your referrals</h1>
+        <button class="secondary" id="close-detail" hidden>Back to referrals</button>
+        <button class="secondary" id="retry-sync">Refresh</button>
+      </header>
       <p id="sync-message" class="message" role="status"></p>
-      <div id="outbox-list"></div>
-      <div id="referral-list"></div>
+      <div id="activity-overview">
+        <div id="outbox-list"></div>
+        <div id="referral-list"></div>
+      </div>
       <section id="activity-detail" class="activity-detail" aria-labelledby="activity-detail-heading" hidden>
         <div id="activity-detail-body"></div>
         <p id="detail-message" class="message" role="status"></p>

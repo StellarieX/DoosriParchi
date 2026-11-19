@@ -168,6 +168,8 @@ function shareControls() {
     <div class="buttons">
       <a class="button" download="doosriparchi.png" href="${safe(issued.qr)}">Save QR image</a>
       <button class="secondary" id="print">Print pass</button>
+    </div>
+    <div class="buttons share-followup">
       ${session.user ? '<button class="secondary" id="review-issued">Review sharing</button>' : ""}
       <button class="secondary" id="new-pass">Start another</button>
     </div>
@@ -223,7 +225,8 @@ byId("patient-step").addEventListener("click", event => {
     case "listen": speak(); break;
     case "print": window.print(); break;
     case "review-issued":
-      openActivity({ id: issued.pass.id, clinic: issued.pass.clinic, expires_at: issued.pass.expires });
+      openActivity(referrals.find(row => row.id === issued.pass.id) ??
+        { id: issued.pass.id, clinic: issued.pass.clinic, expires_at: issued.pass.expires });
       break;
     case "new-pass":
       issued = undefined;
@@ -303,8 +306,8 @@ async function provision() {
 
 function refreshReadiness() {
   byId("offline-ready").textContent = issuerKey
-    ? (offlineShell ? "Ready to scan offline. The issuer key is stored on this device." : "Issuer key loaded. Keep this page open to scan offline.")
-    : "Open this workspace online once to load the issuer key.";
+    ? (offlineShell ? "Ready to scan offline" : "Keep this page open to scan offline.")
+    : "Connect once to enable QR scanning.";
 }
 
 function showVerified(pass) {
@@ -343,12 +346,14 @@ function showVerified(pass) {
     ${activePass.exportReceipt ? `<p class="export-receipt">${receiptLink(activePass.exportReceipt)}</p>` : ""}`;
   if (activePass.markup === content) return;
   activePass.markup = content;
+  byId("scan-result").hidden = false;
   replacePreservingFocus(byId("verified"), content);
 }
 
 function clearVerified() {
   activePass = undefined;
-  byId("verified").innerHTML = '<h2>Referral details</h2><p class="muted">A verified referral will appear here.</p>';
+  byId("scan-result").hidden = true;
+  byId("verified").replaceChildren();
 }
 
 async function verifyToken(input) {
@@ -533,17 +538,24 @@ byId("camera").addEventListener("click", async () => {
 function route() {
   const canView = sessionReady && (!session.enabled || Boolean(session.user));
   const clinic = session.enabled ? Boolean(session.user?.clinic) : location.hash === "#clinic";
-  byId("clinic").hidden = !canView || !clinic;
-  byId("patient").hidden = !canView || clinic;
+  const activity = canView && Boolean(session.user) && location.hash === "#activity";
+  byId("clinic").hidden = !canView || !clinic || activity;
+  byId("patient").hidden = !canView || clinic || activity;
+  byId("sync-section").hidden = !activity;
   byId("clinic-link").hidden = !canView || (session.enabled && !clinic);
   byId("patient-link").hidden = !canView || (session.enabled && clinic);
-  byId("clinic-link").setAttribute("aria-current", clinic ? "page" : "false");
-  byId("patient-link").setAttribute("aria-current", clinic ? "false" : "page");
-  if (!clinic) stopCamera();
-  if (clinic && "speechSynthesis" in window) speechSynthesis.cancel();
+  byId("activity-link").hidden = !canView || !session.user;
+  byId("clinic-link").setAttribute("aria-current", !activity && clinic ? "page" : "false");
+  byId("patient-link").setAttribute("aria-current", !activity && !clinic ? "page" : "false");
+  byId("activity-link").setAttribute("aria-current", activity ? "page" : "false");
+  if (byId("clinic").hidden) stopCamera();
+  if (byId("patient").hidden && "speechSynthesis" in window) speechSynthesis.cancel();
 }
 
-window.addEventListener("hashchange", route);
+window.addEventListener("hashchange", () => {
+  route();
+  if (!byId("sync-section").hidden && !selectedReferral) byId("sync-heading").focus();
+});
 renderStep();
 route();
 provision().catch(() => refreshReadiness());
@@ -563,7 +575,8 @@ function renderAccount() {
     ? '<div><strong>' + safe(user.clinic ? clinics[user.clinic] : "Patient workspace") +
       '</strong><p class="muted">' + safe(user.email) + '</p></div><button class="secondary" id="logout">Sign out</button>'
     : "";
-  byId("sync-section").hidden = !user;
+  byId("activity-link").textContent = user?.clinic ? "Clinic intake" : "Your referrals";
+  byId("clinic-selection").hidden = Boolean(user?.clinic);
   byId("clinic-choice").disabled = Boolean(user?.clinic);
   if (user?.clinic) byId("clinic-choice").value = user.clinic;
   if (step === 0) renderStep();
@@ -572,22 +585,31 @@ function renderAccount() {
 
 function renderActivity() {
   if (!session.user) return;
-  byId("sync-heading").textContent = session.user.clinic ? "Clinic intake" : "Your referrals";
+  const isClinic = Boolean(session.user.clinic);
+  const detailOpen = Boolean(selectedReferral);
+  byId("sync-heading").textContent = isClinic ? "Clinic intake" : "Your referrals";
+  byId("sync-heading").hidden = detailOpen;
+  byId("activity-overview").hidden = detailOpen;
+  byId("close-detail").hidden = !detailOpen;
+  byId("close-detail").textContent = isClinic ? "Back to intake" : "Back to referrals";
   const queue = outbox();
   const queued = queue.map(item =>
-    `<article class="activity-row"><div><strong>${item.failed ? "Acceptance unavailable" : "Pending acceptance"}</strong><p>${safe(clinics[item.clinic])} · ${safe(item.id)}</p>
+    `<article class="activity-row"><div><strong>${item.failed ? "Acceptance unavailable" : "Pending acceptance"}</strong><p>Saved on this device ${safe(formatDate(item.queuedAt))}</p>
     <small>${safe(item.error || "Saved on this device. Will retry when connected.")}</small></div>${item.failed ? `<button class="secondary" data-discard="${safe(item.id)}">Remove failed intake</button>` : ""}</article>`).join("");
   if (queued !== outboxMarkup) {
     outboxMarkup = queued;
     replacePreservingFocus(byId("outbox-list"), queued);
   }
-  const list = referrals.length ? referrals.map(item =>
-    `<article class="activity-row"><div><strong>${session.user.clinic ? "Asha Das · Follow-up referral" : safe(clinics[item.clinic])}</strong>
-      <p>Created ${safe(formatDate(item.issued_at))}</p>
-      <small>${item.accepted_at ? "Accepted for intake · " + safe(formatDate(item.accepted_at)) : "Awaiting clinic intake"}</small>
-      ${item.appointment ? `<p class="appointment-summary">${safe(appointmentState(item.appointment, Boolean(session.user.clinic)))}</p>` : ""}</div>
-      <button class="secondary" id="activity-${safe(item.id)}" data-review="${safe(item.id)}" aria-pressed="${item.id === selectedReferral?.row.id}">${session.user.clinic ? "Open intake" : "Review sharing"}</button></article>`).join("")
-    : '<p class="muted">No referrals yet.</p>';
+  const list = referrals.length ? referrals.map(item => {
+    const state = item.appointment ? appointmentState(item.appointment, isClinic)
+      : item.accepted_at ? "Accepted for intake" : "Awaiting clinic intake";
+    const time = item.appointment && item.appointment.status !== "reschedule_requested"
+      ? formatDate(item.appointment.startsAt) : formatDate(item.accepted_at ?? item.issued_at);
+    return `<article class="activity-row"><div><strong>${isClinic ? "Asha Das · Follow-up referral" : safe(clinics[item.clinic])}</strong>
+      <p class="referral-state">${safe(state)}</p><small>${safe(time)}</small></div>
+      <button class="secondary" id="activity-${safe(item.id)}" data-review="${safe(item.id)}">${isClinic ? "Open intake" : "Review sharing"}</button></article>`;
+  }).join("") : queue.length ? "" : `<div class="activity-empty"><p>${isClinic ? "No referrals in intake yet." : "No referrals yet."}</p>
+    <a class="button" href="${isClinic ? "#clinic" : "#patient"}">${isClinic ? "Scan a referral" : "Send a referral"}</a></div>`;
   if (list !== listMarkup) {
     listMarkup = list;
     replacePreservingFocus(byId("referral-list"), list);
@@ -600,6 +622,8 @@ function openActivity(row) {
     selectedReferral = { row };
     message("detail-message");
   }
+  if (location.hash !== "#activity") location.hash = "#activity";
+  route();
   renderActivity();
   renderActivityDetail();
   byId("activity-detail-heading").focus();
@@ -613,8 +637,13 @@ function closeActivity() {
   byId("activity-detail-body").replaceChildren();
   message("detail-message");
   renderActivity();
-  if (rowId) (byId("activity-" + rowId) ?? byId("review-issued"))?.focus();
+  if (rowId) (byId("activity-" + rowId) ?? byId("sync-heading")).focus();
 }
+
+byId("close-detail").addEventListener("click", closeActivity);
+byId("activity-link").addEventListener("click", () => {
+  if (selectedReferral) closeActivity();
+});
 
 const recordLabels = { result: "Lab result", history: "Medical history", note: "Referral note", "previous-result": "Previous hemoglobin" };
 const eventTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
@@ -628,7 +657,7 @@ function appointmentState(appointment, isClinic) {
   return isClinic ? "Waiting for patient confirmation" : "Appointment offered";
 }
 
-function appointmentMarkup(row, isClinic, online) {
+function appointmentMarkup(row, isClinic, online, expanded) {
   if (!row.accepted_at) return "";
   const { appointment } = row;
   const disabled = online ? "" : "disabled";
@@ -644,13 +673,14 @@ function appointmentMarkup(row, isClinic, online) {
       ${passed ? '<p class="muted">This time has passed.</p>' : `<button id="confirm-appointment" data-appointment="confirm" data-proposal="${safe(appointment.id)}" ${disabled}>Confirm appointment</button>`}
       <button class="secondary" id="reschedule-appointment" data-appointment="reschedule" data-proposal="${safe(appointment.id)}" ${disabled}>Ask for another time</button>
     </div>` : ""}
-    ${canPropose ? `<form id="appointment-form" data-proposal="${safe(appointment?.id ?? "")}">
+    ${canPropose ? `<details id="appointment-editor" class="activity-reveal" ${expanded ? "open" : ""}><summary id="appointment-toggle">${appointment ? "Propose another time" : "Propose a time"}</summary>
+    <form id="appointment-form" data-proposal="${safe(appointment?.id ?? "")}">
       <label class="label" for="appointment-start">Date and time on this device</label>
       <input type="datetime-local" id="appointment-start" name="startsAt" required ${disabled}>
       <label class="label" for="appointment-instructions">Where to go or what to bring (optional)</label>
       <textarea id="appointment-instructions" name="instructions" rows="2" maxlength="400" ${disabled}>${safe(appointment?.instructions ?? "")}</textarea>
-      <button id="propose-appointment" type="submit" ${disabled}>${appointment ? "Propose another time" : "Propose appointment"}</button>
-    </form>` : ""}
+      <button id="propose-appointment" type="submit" ${disabled}>Send appointment offer</button>
+    </form></details>` : ""}
   </section>`;
 }
 
@@ -713,7 +743,7 @@ function patientLedger(review, clinic, expired, online) {
   </section>`;
 }
 
-function requestMarkup(review, clinic, isClinic, expired, online) {
+function requestMarkup(review, clinic, isClinic, expired, online, expanded) {
   const record = review.items?.find(item => item.id === "previous-result");
   const request = review.request;
   if (!request && !isClinic) return "";
@@ -721,11 +751,11 @@ function requestMarkup(review, clinic, isClinic, expired, online) {
   const reason = request ? `<p class="request-reason">${safe(request.reason)}</p>` : "";
   let content;
   if (!request) {
-    content = expired ? '<p class="muted">This referral has expired.</p>' : `<form id="request-record">
+    content = expired ? '<p class="muted">This referral has expired.</p>' : `<details id="request-editor" class="activity-reveal" ${expanded ? "open" : ""}><summary id="request-toggle">Request previous hemoglobin</summary><form id="request-record">
       <label class="label" for="request-reason">Why does the clinic need this result?</label>
       <textarea id="request-reason" name="reason" rows="2" maxlength="240" required ${disabled}></textarea>
-      <button type="submit" ${disabled}>Request previous hemoglobin</button>
-    </form>`;
+      <button type="submit" ${disabled}>Send request</button>
+    </form></details>`;
   } else if (request.status === "pending") {
     content = `<p>${expired ? "The referral expired before a decision was recorded." : isClinic ? "Waiting for Asha to decide." : safe(clinic) + " needs this result for the following reason."}</p>
       ${reason}${record ? `<div class="record-preview"><strong>${safe(record.label)}</strong><p>${safe(record.text)}</p></div>` : ""}
@@ -738,7 +768,7 @@ function requestMarkup(review, clinic, isClinic, expired, online) {
   } else {
     content = `<p>Request declined.</p>${reason}`;
   }
-  return `<section class="record-request"><h3>${isClinic ? "Previous hemoglobin" : "Request for previous hemoglobin"}</h3>${content}</section>`;
+  return `<section class="record-request">${request ? `<h3>${isClinic ? "Previous hemoglobin" : "Request for previous hemoglobin"}</h3>` : ""}${content}</section>`;
 }
 
 function clinicLedger(selected, expired, online) {
@@ -763,20 +793,25 @@ function renderActivityDetail() {
   const reason = sameReferral ? byId("request-reason") : null;
   const entry = reason?.value;
   const selection = reason ? [reason.selectionStart, reason.selectionEnd, reason.selectionDirection] : undefined;
+  const requestOpen = reason && byId("request-editor").open;
   const form = sameReferral ? byId("appointment-form") : null;
   const appointmentDraft = form && {
-    proposal: form.dataset.proposal, startsAt: form.elements.startsAt.value, instructions: form.elements.instructions.value
+    proposal: form.dataset.proposal, startsAt: form.elements.startsAt.value, instructions: form.elements.instructions.value,
+    open: byId("appointment-editor").open
   };
-  const content = `<header class="activity-detail-header"><div>
-    <h2 id="activity-detail-heading" tabindex="-1">${isClinic ? "Asha Das’s intake" : `Your referral to ${safe(clinic)}`}</h2>
+  const appointmentOpen = appointmentDraft?.proposal === (row.appointment?.id ?? "") && appointmentDraft.open;
+  const request = review ? requestMarkup(review, clinic, isClinic, expired, online, requestOpen) : "";
+  const content = `<header class="activity-detail-header">
+    <h1 id="activity-detail-heading" tabindex="-1">${isClinic ? "Asha Das’s intake" : `Your referral to ${safe(clinic)}`}</h1>
     ${!isClinic && row.accepted_at && !row.appointment ? '<p>The clinic accepted your referral for intake. Check this page for an appointment offer.</p>' : ""}
-    </div><button class="secondary" id="close-detail">Close details</button></header>
+    </header>
     ${!online ? '<p class="detail-offline">Reconnect to check current access or make changes.</p>' : ""}
-    ${appointmentMarkup(row, isClinic, online)}
+    ${appointmentMarkup(row, isClinic, online, appointmentOpen)}
     ${isClinic ? "" : passRecoveryMarkup(selected, expired, online)}
     ${review ? `<div class="activity-columns"><div class="activity-record">
-      ${requestMarkup(review, clinic, isClinic, expired, online)}
+      ${isClinic ? "" : request}
       ${isClinic ? clinicLedger(selected, expired, online) : patientLedger(review, clinic, expired, online)}
+      ${isClinic ? request : ""}
     </div>${timelineMarkup(review, clinic, isClinic)}</div>` :
       online ? `<p class="muted">${isClinic && expired ? "Access to clinical details ended when the referral expired." : "Loading sharing and activity…"}</p>` : ""}`;
   byId("activity-detail").hidden = false;
@@ -825,10 +860,11 @@ async function refreshReview(selected) {
   }
 }
 
-async function refreshActivity() {
+async function refreshActivity(announce = false) {
   if (!session.enabled || !session.user || syncBusy) return;
   syncBusy = true;
   const account = session.user.id;
+  if (announce) message("sync-message", "Refreshing…");
   try {
     renderActivity();
     if (!navigator.onLine) {
@@ -850,7 +886,7 @@ async function refreshActivity() {
     }
     renderActivity();
     if (activePass) showVerified(activePass.pass);
-    message("sync-message", "Up to date.");
+    message("sync-message", announce ? "Referrals updated." : "");
     if (activePass && referrals.some(item => item.id === activePass.pass.id && item.accepted_at)) {
       message("clinic-message", "Referral accepted. The patient can see the receipt.");
     }
@@ -905,7 +941,7 @@ async function submitAccount(event) {
     }
     await login(credentials);
     form.reset();
-    location.hash = session.user?.clinic ? "#clinic" : "#patient";
+    if (location.hash !== "#activity") location.hash = session.user?.clinic ? "#clinic" : "#patient";
     await refreshActivity();
   } catch (error) {
     message("auth-message", error instanceof TypeError ? "Reconnect and try again." : error.message, true);
@@ -999,6 +1035,8 @@ function reissueFromReview(selected) {
   });
   issued = undefined;
   closeActivity();
+  location.hash = "#patient";
+  route();
   goTo(0);
 }
 
@@ -1013,7 +1051,6 @@ async function changeSharing(action, reason) {
 byId("activity-detail").addEventListener("click", async event => {
   const button = event.target.closest("button");
   if (!button) return;
-  if (button.id === "close-detail") return closeActivity();
   if (button.id === "reissue-pass") return reissueFromReview(selectedReferral);
   if (button.id === "recover-pass") {
     const selected = selectedReferral;
@@ -1067,7 +1104,7 @@ byId("outbox-list").addEventListener("click", event => {
     if (activePass) showVerified(activePass.pass);
   } catch (error) { message("sync-message", error.message, true); }
 });
-byId("retry-sync").addEventListener("click", refreshActivity);
+byId("retry-sync").addEventListener("click", () => refreshActivity(true));
 window.addEventListener("referral-account", () => {
   if (activeAccountId !== session.user?.id) {
     referrals = [];
@@ -1088,7 +1125,7 @@ async function checkSession() {
   try {
     await loadSession();
     if (!sessionReady) throw new Error("Session unavailable");
-    if (session.user?.clinic) location.hash = "#clinic";
+    if (session.user?.clinic && location.hash !== "#activity") location.hash = "#clinic";
     await refreshActivity();
   } catch {
     if (!sessionReady) {

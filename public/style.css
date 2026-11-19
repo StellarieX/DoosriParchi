@@ -137,6 +137,8 @@ textarea { resize: vertical; }
 form .label { margin-top: 13px; }
 form button { margin-top: 10px; }
 .pass-qr { width: min(100%, 280px); height: auto; display: block; background: white; border: 1px solid var(--line); }
+.share-followup { border-top: 1px solid var(--line); padding-top: 8px; }
+.share-followup button { padding-inline: 0; border-color: transparent; text-decoration: underline; text-underline-offset: 3px; }
 .verified-tag { display: inline-block; color: #345b46; border: 1px solid #a8bfad; border-radius: 3px; padding: 4px 8px; font-size: .76rem; font-weight: 660; }
 video { width: 100%; margin-top: 14px; border-radius: 4px; background: var(--ink); }
 @media (max-width: 900px) {
@@ -218,16 +220,23 @@ video { width: 100%; margin-top: 14px; border-radius: 4px; background: var(--ink
 .referral-action { background: var(--mint); padding: 12px; margin: 18px 0; border-radius: 7px; }
 .referral-action p { margin: 0; font-size: .9rem; }
 .accepted-state { color: #345b46; font-size: .87rem; }
-.sync-section { margin-top: 35px; border-top: 1px solid var(--line); padding-top: 22px; }
 .sync-heading { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.activity-empty { padding: 24px; background: var(--paper); border: 1px solid var(--line); border-radius: 9px; }
+.activity-empty p { margin-top: 0; }
 .activity-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; border-bottom: 1px solid var(--line); }
 .activity-row p { margin: 3px 0; font-size: .8rem; overflow-wrap: anywhere; }
 .activity-row small { color: var(--muted); }
 .activity-row > div { min-width: 0; }
 #outbox-list .activity-row { background: #f8f2e2; padding: 12px; }
 @media (max-width: 520px) {
-  .activity-row { align-items: start; flex-direction: column; }
-  #account-summary { align-items: start; }
+  .mast-inner { flex-direction: column; align-items: stretch; gap: 6px; padding-block: 13px 7px; }
+  .mast-inner nav { justify-content: flex-start; }
+  .mast-inner nav a { min-height: 44px; }
+  .mast-inner nav a:last-child { margin-left: auto; color: #bed8cf; }
+  .account-panel { margin-bottom: 18px; padding-top: 0; }
+  #account-summary p { overflow-wrap: anywhere; }
+  #account-summary button { flex: none; }
+  .activity-row { flex-wrap: wrap; gap: 10px; }
 }
 @media (max-width: 720px) {
   .entry-layout { grid-template-columns: minmax(0, 1fr); min-height: auto; padding: clamp(16px, 5vw, 30px); gap: 22px; border-radius: 16px; }
@@ -236,11 +245,11 @@ video { width: 100%; margin-top: 14px; border-radius: 4px; background: var(--ink
   .entry-slip { display: none; }
 }
 @media print {
-  .entry-layout, .account-panel, .sync-section, .online-preview { display: none !important; }
+  .entry-layout, .account-panel, #sync-section, .online-preview { display: none !important; }
 }
 .activity-detail { margin: 24px 0; padding: clamp(15px, 2.5vw, 32px); background: white; border: 1px solid var(--line); }
-.activity-detail-header { display: flex; justify-content: space-between; align-items: start; gap: 1rem; margin-bottom: 22px; }
-.activity-detail-header h2 { font-size: clamp(1.3rem, 2.4vw, 1.8rem); }
+.activity-detail-header { margin-bottom: 22px; }
+.activity-detail-header h1 { font-size: clamp(1.55rem, 3vw, 2.15rem); }
 .activity-detail-header p, .ledger-help, .withdraw-note p { font-size: .87rem; color: var(--muted); }
 .activity-columns { display: grid; grid-template-columns: minmax(0, 3fr) minmax(200px, 2fr); gap: clamp(18px, 3vw, 38px); }
 .activity-record > section + section { margin-top: 23px; }
@@ -254,9 +263,12 @@ video { width: 100%; margin-top: 14px; border-radius: 4px; background: var(--ink
 .appointment-status { padding: 4px 8px; border-radius: 4px; color: var(--sky-ink); background: var(--sky); font-size: .8rem; font-weight: 650; }
 .appointment-status[data-status="confirmed"] { color: var(--accent); background: var(--mint); }
 .appointment-status[data-status="reschedule_requested"] { color: #6a4b17; background: #f8edce; }
-.appointment-summary { color: var(--accent); font-weight: 650; }
+.referral-state { color: var(--accent); font-weight: 650; }
 .appointment-time { margin-bottom: 5px; font-size: 1.1rem; font-weight: 680; }
 .appointment-instructions { margin-bottom: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.activity-reveal { margin-top: 10px; }
+.activity-reveal summary { width: fit-content; padding-block: 10px; color: var(--accent); font-size: .88rem; font-weight: 650; cursor: pointer; }
+.activity-reveal form { padding-top: 4px; }
 #appointment-form { max-width: 520px; }
 #appointment-start { width: 100%; padding: 10px 11px; border: 1px solid var(--control); border-radius: 7px; background: var(--paper); color: inherit; font: inherit; }
 .consent-row { padding: 12px 0; border-top: 1px solid var(--line); }
