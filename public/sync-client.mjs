@@ -3,6 +3,7 @@ const queueKey = id => "referral-outbox:" + id;
 let flushing = false;
 
 export let session = { enabled: false, user: null };
+export let sessionReady = false;
 
 export async function request(path, payload) {
   const response = await fetch("/api/" + path, payload === undefined ? { cache: "no-store" } : {
@@ -23,6 +24,7 @@ function announce() {
 
 function remember(next) {
   session = next;
+  sessionReady = true;
   try { localStorage.setItem(sessionKey, JSON.stringify(next)); }
   catch { /* The current authenticated session remains usable without persistence. */ }
   announce();
@@ -36,7 +38,10 @@ export async function loadSession() {
     if (!navigator.onLine || error instanceof TypeError) {
       try {
         const cached = JSON.parse(localStorage.getItem(sessionKey));
-        if (cached && typeof cached.enabled === "boolean") session = cached;
+        if (cached && typeof cached.enabled === "boolean") {
+          session = cached;
+          sessionReady = true;
+        }
       } catch { /* No previous account is available offline. */ }
       announce();
       return false;

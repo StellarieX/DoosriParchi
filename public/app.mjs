@@ -1,5 +1,5 @@
 import { clinics, defaultSelection, disclosure, hasConflict, toFhir } from "./case.mjs";
-import { session, request as api, loadSession, login, logout, outbox, queueAcceptance, flushOutbox, discardQueued } from "./sync-client.mjs";
+import { session, sessionReady, request as api, loadSession, login, logout, outbox, queueAcceptance, flushOutbox, discardQueued } from "./sync-client.mjs";
 
 const byId = id => document.getElementById(id);
 const draft = { clinic: "north", fields: [...defaultSelection], cleaned: false, language: "en", printMode: "full" };
@@ -100,7 +100,7 @@ function updateConflict() {
 }
 
 function readback() {
-  const details = disclosure(draft.fields, draft.cleaned).map(item => item.text).join(". ");
+  const details = disclosure(draft.fields, draft.cleaned).map(item => item.text.replace(/\.$/, "")).join(". ");
   if (draft.language === "hi") {
     const has = id => draft.fields.includes(id);
     const recipient = draft.clinic === "north" ? "नॉर्थ क्लिनिक" : "साउथ क्लिनिक";
@@ -305,7 +305,7 @@ function showVerified(pass) {
     ${entryMarkup(items.filter(item => item.id !== "note"))}
     ${accept}
     <p class="sheet-foot">${checkedAt ? "Issuer confirmed at " + safe(formatDate(checkedAt)) + "." : "Verified on this device. Issuer status has yet to be checked."}</p>
-    <div class="buttons"><button class="secondary" id="check-online">Check with issuer</button>
+    <div class="buttons"><button class="secondary" id="check-online" ${navigator.onLine ? "" : "disabled"}>Check with issuer</button>
     <button class="secondary" id="export">${online ? "Download current FHIR bundle" : "Download printed items only (FHIR)"}</button>${restricted}
     ${accepted ? '<button class="secondary" id="open-accepted">Open clinic intake</button>' : ""}</div>`;
   if (activePass.markup === content) return;
@@ -377,7 +377,8 @@ byId("verified").addEventListener("click", async event => {
     try {
       queueAcceptance(current);
       showVerified(current.pass);
-      message("clinic-message", "Referral saved on this device. Syncing acceptance…");
+      message("clinic-message", navigator.onLine ? "Referral saved on this device. Syncing acceptance…"
+        : "Referral saved offline. Acceptance will sync when you reconnect.");
       await refreshActivity();
     } catch (error) {
       message("clinic-message", error.message, true);
@@ -489,12 +490,12 @@ byId("camera").addEventListener("click", async () => {
 });
 
 function route() {
-  const canView = !session.enabled || session.user;
+  const canView = sessionReady && (!session.enabled || Boolean(session.user));
   const clinic = session.enabled ? Boolean(session.user?.clinic) : location.hash === "#clinic";
   byId("clinic").hidden = !canView || !clinic;
   byId("patient").hidden = !canView || clinic;
-  byId("clinic-link").hidden = session.enabled && !session.user?.clinic;
-  byId("patient-link").hidden = session.enabled && (!session.user || clinic);
+  byId("clinic-link").hidden = !canView || (session.enabled && !clinic);
+  byId("patient-link").hidden = !canView || (session.enabled && clinic);
   byId("clinic-link").setAttribute("aria-current", clinic ? "page" : "false");
   byId("patient-link").setAttribute("aria-current", clinic ? "false" : "page");
   if (!clinic) stopCamera();
@@ -512,13 +513,15 @@ if ("serviceWorker" in navigator) {
   }).catch(() => refreshReadiness());
 }
 function renderAccount() {
-  byId("account-panel").hidden = !session.enabled;
-  byId("login-form").hidden = Boolean(session.user);
   const user = session.user;
+  byId("entry-layout").hidden = sessionReady && (!session.enabled || Boolean(user));
+  byId("session-check").hidden = sessionReady;
+  byId("auth-forms").hidden = !sessionReady;
+  byId("account-panel").hidden = !user;
   byId("account-summary").innerHTML = user
     ? '<div><strong>' + safe(user.clinic ? clinics[user.clinic] : "Patient workspace") +
       '</strong><p class="muted">' + safe(user.email) + '</p></div><button class="secondary" id="logout">Sign out</button>'
-    : '<p>Sign in to create referrals or accept them into your clinic.</p>';
+    : "";
   byId("sync-section").hidden = !user;
   byId("clinic-choice").disabled = Boolean(user?.clinic);
   if (user?.clinic) byId("clinic-choice").value = user.clinic;
@@ -540,7 +543,8 @@ function renderActivity() {
   const list = referrals.length ? referrals.map(item =>
     `<article class="activity-row"><div><strong>${session.user.clinic ? "Asha Das · Follow-up referral" : safe(clinics[item.clinic])}</strong>
       <p>Created ${safe(formatDate(item.issued_at))}</p>
-      <small>${item.accepted_at ? "Accepted for intake · " + safe(formatDate(item.accepted_at)) : "Awaiting clinic intake"}</small></div>
+      <small>${item.accepted_at ? "Accepted for intake · " + safe(formatDate(item.accepted_at)) : "Awaiting clinic intake"}</small>
+      ${item.appointment ? `<p class="appointment-summary">${safe(appointmentState(item.appointment, Boolean(session.user.clinic)))}</p>` : ""}</div>
       <button class="secondary" id="activity-${safe(item.id)}" data-review="${safe(item.id)}" aria-pressed="${item.id === selectedReferral?.row.id}">${session.user.clinic ? "Open intake" : "Review sharing"}</button></article>`).join("")
     : '<p class="muted">No referrals yet.</p>';
   if (list !== listMarkup) {
@@ -573,6 +577,55 @@ function closeActivity() {
 
 const recordLabels = { result: "Lab result", history: "Medical history", note: "Referral note", "previous-result": "Previous hemoglobin" };
 const eventTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
+const appointmentTime = new Intl.DateTimeFormat(undefined, {
+  year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short"
+});
+
+function appointmentState(appointment, isClinic) {
+  if (appointment.status === "confirmed") return "Appointment confirmed";
+  if (appointment.status === "reschedule_requested") return isClinic ? "Patient asked for another time" : "Another time requested";
+  return isClinic ? "Waiting for patient confirmation" : "Appointment offered";
+}
+
+function appointmentMarkup(row, isClinic, online) {
+  if (!row.accepted_at) return "";
+  const { appointment } = row;
+  const disabled = online ? "" : "disabled";
+  const state = appointment ? appointmentState(appointment, isClinic) : "No time proposed yet";
+  const passed = appointment && Date.parse(appointment.startsAt) <= Date.now();
+  const canRespond = !isClinic && appointment?.status === "proposed";
+  const canPropose = isClinic && appointment?.status !== "confirmed";
+  return `<section class="appointment-panel" aria-labelledby="appointment-heading">
+    <div class="appointment-heading"><h3 id="appointment-heading">Appointment</h3><span class="appointment-status" data-status="${safe(appointment?.status ?? "waiting")}">${safe(state)}</span></div>
+    ${appointment ? `<p class="appointment-time"><time datetime="${safe(appointment.startsAt)}">${safe(appointmentTime.format(new Date(appointment.startsAt)))}</time></p>
+      ${appointment.instructions ? `<p class="appointment-instructions">${safe(appointment.instructions)}</p>` : ""}` : ""}
+    ${canRespond ? `<div class="buttons">
+      ${passed ? '<p class="muted">This time has passed.</p>' : `<button id="confirm-appointment" data-appointment="confirm" data-proposal="${safe(appointment.id)}" ${disabled}>Confirm appointment</button>`}
+      <button class="secondary" id="reschedule-appointment" data-appointment="reschedule" data-proposal="${safe(appointment.id)}" ${disabled}>Ask for another time</button>
+    </div>` : ""}
+    ${canPropose ? `<form id="appointment-form" data-proposal="${safe(appointment?.id ?? "")}">
+      <label class="label" for="appointment-start">Date and time on this device</label>
+      <input type="datetime-local" id="appointment-start" name="startsAt" required ${disabled}>
+      <label class="label" for="appointment-instructions">Where to go or what to bring (optional)</label>
+      <textarea id="appointment-instructions" name="instructions" rows="2" maxlength="400" ${disabled}>${safe(appointment?.instructions ?? "")}</textarea>
+      <button id="propose-appointment" type="submit" ${disabled}>${appointment ? "Propose another time" : "Propose appointment"}</button>
+    </form>` : ""}
+  </section>`;
+}
+
+function passRecoveryMarkup(selected, expired, online) {
+  const canReissue = expired || selected.review?.printMode === "unknown" || selected.recoveryUnavailable;
+  if (canReissue) return `<section class="pass-recovery"><h3>Referral QR</h3>
+    <p class="muted">${expired ? "This QR has expired." : "The original QR cannot be recovered."} Review a new pass to share it again.</p>
+    ${selected.row.appointment ? '<p class="muted">Any appointment stays with this referral.</p>' : ""}
+    <button id="reissue-pass" class="secondary" ${online && selected.review ? "" : "disabled"}>Review a fresh referral</button></section>`;
+  const recovered = selected.recovered;
+  return `<section class="pass-recovery"><h3>Referral QR</h3>
+    ${recovered ? `<p class="muted">Original expiry ${safe(formatDate(recovered.pass.expires))}.</p>
+      <img class="pass-qr" src="${safe(recovered.qr)}" alt="Recovered signed referral QR">
+      <a class="button secondary" download="doosriparchi.png" href="${safe(recovered.qr)}">Save QR image</a>`
+      : `<button id="recover-pass" class="secondary" ${online ? "" : "disabled"}>Show signed QR</button>`}</section>`;
+}
 
 function timelineMarkup(review, clinic, isClinic) {
   const titles = {
@@ -662,23 +715,36 @@ function renderActivityDetail() {
   const expired = new Date(row.expires_at).getTime() <= Date.now();
   const online = navigator.onLine;
   const body = byId("activity-detail-body");
-  const reason = byId("request-reason");
+  const sameReferral = body.dataset.referral === row.id;
+  const reason = sameReferral ? byId("request-reason") : null;
   const entry = reason?.value;
   const selection = reason ? [reason.selectionStart, reason.selectionEnd, reason.selectionDirection] : undefined;
+  const form = sameReferral ? byId("appointment-form") : null;
+  const appointmentDraft = form && {
+    proposal: form.dataset.proposal, startsAt: form.elements.startsAt.value, instructions: form.elements.instructions.value
+  };
   const content = `<header class="activity-detail-header"><div>
     <h2 id="activity-detail-heading" tabindex="-1">${isClinic ? "Asha Das’s intake" : `Your referral to ${safe(clinic)}`}</h2>
-    ${!isClinic && row.accepted_at ? '<p>Intake confirms the clinic received your referral. Contact the clinic to schedule a visit.</p>' : ""}
+    ${!isClinic && row.accepted_at && !row.appointment ? '<p>The clinic accepted your referral for intake. Check this page for an appointment offer.</p>' : ""}
     </div><button class="secondary" id="close-detail">Close details</button></header>
     ${!online ? '<p class="detail-offline">Reconnect to check current access or make changes.</p>' : ""}
+    ${appointmentMarkup(row, isClinic, online)}
+    ${isClinic ? "" : passRecoveryMarkup(selected, expired, online)}
     ${review ? `<div class="activity-columns"><div class="activity-record">
       ${requestMarkup(review, clinic, isClinic, expired, online)}
       ${isClinic ? clinicLedger(selected, expired, online) : patientLedger(review, clinic, expired, online)}
     </div>${timelineMarkup(review, clinic, isClinic)}</div>` :
-      online ? "<p class=\"muted\">Load sharing and activity for this referral.</p>" : ""}`;
+      online ? `<p class="muted">${isClinic && expired ? "Access to clinical details ended when the referral expired." : "Loading sharing and activity…"}</p>` : ""}`;
   byId("activity-detail").hidden = false;
   if (selected.markup === content) return;
   selected.markup = content;
+  body.dataset.referral = row.id;
   replacePreservingFocus(body, content);
+  const nextAppointment = byId("appointment-form");
+  if (appointmentDraft && nextAppointment?.dataset.proposal === appointmentDraft.proposal) {
+    nextAppointment.elements.startsAt.value = appointmentDraft.startsAt;
+    nextAppointment.elements.instructions.value = appointmentDraft.instructions;
+  }
   const nextReason = byId("request-reason");
   if (nextReason && selection) {
     nextReason.value = entry;
@@ -700,6 +766,7 @@ function setReview(selected, review) {
 
 async function refreshReview(selected) {
   if (!selected || selected !== selectedReferral || selected.reading || selected.saving || !navigator.onLine) return;
+  if (session.user?.clinic && Date.parse(selected.row.expires_at) <= Date.now()) return;
   selected.reading = true;
   const revision = selected.revision;
   try {
@@ -731,7 +798,10 @@ async function refreshActivity() {
     referrals = result.referrals;
     if (selectedReferral) {
       const row = referrals.find(item => item.id === selectedReferral.row.id);
-      if (row) selectedReferral.row = row;
+      if (row) {
+        selectedReferral.row = row;
+        renderActivityDetail();
+      }
       await refreshReview(selectedReferral);
     }
     renderActivity();
@@ -751,22 +821,67 @@ async function refreshActivity() {
   }
 }
 
-byId("login-form").addEventListener("submit", async event => {
+function showAuthForm(signup, email) {
+  const shown = byId(signup ? "signup-form" : "login-form");
+  const hidden = byId(signup ? "login-form" : "signup-form");
+  hidden.reset();
+  hidden.hidden = true;
+  shown.hidden = false;
+  shown.elements.email.value = email;
+  byId("auth-title").textContent = signup ? "Create a patient account" : "Sign in";
+  byId("auth-description").textContent = signup
+    ? "You’ll confirm your email before you can send a referral." : "Use your patient or clinic account.";
+  byId("toggle-auth").textContent = signup ? "Back to sign in" : "Create a patient account";
+  shown.elements.email.focus();
+}
+
+byId("toggle-auth").addEventListener("click", () => {
+  const signup = byId("signup-form").hidden;
+  const form = byId(signup ? "login-form" : "signup-form");
+  message("auth-message");
+  showAuthForm(signup, form.elements.email.value);
+});
+
+async function submitAccount(event) {
   event.preventDefault();
   const form = event.target;
+  const signup = form.id === "signup-form";
   const button = form.querySelector("button");
   button.disabled = true;
-  message("account-message");
+  byId("toggle-auth").disabled = true;
+  message("auth-message");
   try {
     const data = new FormData(form);
-    await login({ email: data.get("email"), password: data.get("password") });
+    const credentials = { email: data.get("email"), password: data.get("password") };
+    if (signup) {
+      await api("signup", credentials);
+      showAuthForm(false, credentials.email);
+      message("auth-message", "Check your inbox for a confirmation link. If you already have an account, you can sign in.");
+      return;
+    }
+    await login(credentials);
     form.reset();
     location.hash = session.user?.clinic ? "#clinic" : "#patient";
     await refreshActivity();
   } catch (error) {
-    message("account-message", error instanceof TypeError ? "Connect to sign in." : error.message, true);
-  } finally { button.disabled = false; }
-});
+    message("auth-message", error instanceof TypeError ? "Reconnect and try again." : error.message, true);
+  } finally {
+    button.disabled = false;
+    byId("toggle-auth").disabled = false;
+  }
+}
+
+byId("login-form").addEventListener("submit", submitAccount);
+byId("signup-form").addEventListener("submit", submitAccount);
+
+const callback = new URL(location.href);
+if (callback.searchParams.get("auth") === "confirmed") {
+  const result = new URLSearchParams(callback.hash.slice(1));
+  const failed = result.has("error") || callback.searchParams.has("error");
+  history.replaceState(null, "", location.pathname);
+  message("auth-message", failed ? "This confirmation link is invalid or expired. Try creating the account again."
+    : "Sign in after confirming your email.", failed);
+}
 
 byId("account-summary").addEventListener("click", async event => {
   if (event.target.id !== "logout") return;
@@ -804,6 +919,45 @@ async function detailAction(selected, operation) {
   }
 }
 
+async function submitAppointment(action, proposalId, form) {
+  const selected = selectedReferral;
+  if (!selected) return;
+  await detailAction(selected, async () => {
+    const { row } = selected;
+    const update = { id: row.id, action, proposalId: proposalId || null };
+    if (form) {
+      const startsAt = new Date(form.elements.startsAt.value);
+      if (!Number.isFinite(startsAt.getTime())) throw new Error("Choose a future appointment time.");
+      update.startsAt = startsAt.toISOString();
+      update.instructions = form.elements.instructions.value;
+    }
+    const { appointment } = await api("appointment", update);
+    if (selected !== selectedReferral) return;
+    selected.row = { ...selected.row, appointment };
+    referrals = referrals.map(item => item.id === row.id ? { ...item, appointment } : item);
+    renderActivity();
+    renderActivityDetail();
+    byId("activity-detail-heading").focus();
+    message("detail-message", action === "propose" ? "Appointment offer sent to the patient."
+      : action === "confirm" ? "Appointment confirmed. The clinic can see your response." : "The clinic can now propose another time.");
+  });
+}
+
+function reissueFromReview(selected) {
+  if (!selected?.review) return;
+  const { row, review } = selected;
+  const items = review.items.filter(item => ["result", "history", "note"].includes(item.id) &&
+    !(item.id === "note" && review.withdrawn));
+  Object.assign(draft, {
+    clinic: row.clinic, fields: items.map(item => item.id),
+    cleaned: items.find(item => item.id === "note")?.text === disclosure(["note"], true)[0].text,
+    printMode: review.printMode === "full" ? "full" : "minimal"
+  });
+  issued = undefined;
+  closeActivity();
+  goTo(0);
+}
+
 async function changeSharing(action, reason) {
   const selected = selectedReferral;
   await detailAction(selected, async () => {
@@ -816,6 +970,22 @@ byId("activity-detail").addEventListener("click", async event => {
   const button = event.target.closest("button");
   if (!button) return;
   if (button.id === "close-detail") return closeActivity();
+  if (button.id === "reissue-pass") return reissueFromReview(selectedReferral);
+  if (button.id === "recover-pass") {
+    const selected = selectedReferral;
+    return detailAction(selected, async () => {
+      try {
+        selected.recovered = await api("recover", { id: selected.row.id });
+      } catch (error) {
+        if ([409, 410].includes(error.status)) selected.recoveryUnavailable = true;
+        throw error;
+      } finally {
+        if (selected === selectedReferral) renderActivityDetail();
+      }
+      if (selected === selectedReferral) byId("activity-detail-heading").focus();
+    });
+  }
+  if (button.dataset.appointment) return submitAppointment(button.dataset.appointment, button.dataset.proposal);
   if (button.dataset.manage) return changeSharing(button.dataset.manage);
   if (!["view-intake", "export-intake"].includes(button.id)) return;
   const selected = selectedReferral;
@@ -834,6 +1004,10 @@ byId("activity-detail").addEventListener("click", async event => {
 });
 
 byId("activity-detail").addEventListener("submit", event => {
+  if (event.target.id === "appointment-form") {
+    event.preventDefault();
+    return submitAppointment("propose", event.target.dataset.proposal, event.target);
+  }
   if (event.target.id !== "request-record") return;
   event.preventDefault();
   changeSharing("request", new FormData(event.target).get("reason").trim());
@@ -861,12 +1035,26 @@ window.addEventListener("referral-account", () => {
   renderAccount();
 });
 window.addEventListener("referral-outbox", renderActivity);
-window.addEventListener("online", async () => {
+async function checkSession() {
+  const retry = byId("retry-session");
+  retry.hidden = true;
+  byId("session-status").textContent = "Checking your connection…";
   try {
     await loadSession();
+    if (!sessionReady) throw new Error("Session unavailable");
+    if (session.user?.clinic) location.hash = "#clinic";
     await refreshActivity();
-  } catch (error) { message("account-message", error.message, true); }
-});
+  } catch {
+    if (!sessionReady) {
+      byId("session-status").textContent = "Couldn’t connect. Check your internet connection and try again.";
+      retry.hidden = false;
+    } else if (session.user) {
+      message("account-message", "Couldn’t check your sign-in. Try again when connected.", true);
+    }
+  }
+}
+byId("retry-session").addEventListener("click", checkSession);
+window.addEventListener("online", checkSession);
 window.addEventListener("offline", () => {
   if (activePass) {
     delete activePass.onlineItems;
@@ -882,11 +1070,4 @@ setInterval(() => {
   if (!document.hidden) refreshActivity();
 }, 8000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshActivity(); });
-loadSession().then(() => {
-  renderAccount();
-  if (session.user?.clinic) location.hash = "#clinic";
-  return refreshActivity();
-}).catch(error => {
-  byId("account-panel").hidden = false;
-  message("account-message", "Account connection unavailable. " + error.message, true);
-});
+checkSession();

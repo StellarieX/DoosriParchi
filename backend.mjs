@@ -2,8 +2,8 @@ import { createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sig
 import qrcode from "qrcode";
 import { clinics, disclosure, hasConflict } from "./public/case.mjs";
 import {
-  RequestError, syncEnabled, signIn, signOut, userFor, registerPass, recordAcceptance, listReferrals, loadDetails,
-  manageReferral
+  RequestError, syncEnabled, signIn, signUp, signOut, userFor, registerPass, recordAcceptance, listReferrals, loadDetails,
+  manageReferral, patientReferral, changeAppointment
 } from "./sync.mjs";
 
 const production = process.env.NODE_ENV === "production";
@@ -74,15 +74,21 @@ async function issue({ clinic, fields, cleaned, answer, language, printMode = "f
   const id = randomUUID();
   const items = disclosure(fields, cleaned);
   const paperItems = printMode === "minimal" ? items.filter(item => item.id === "result") : items;
-  const pass = {
-    v: 1, id, issuer: "Cedar Health", clinic, issued, expires: issued + passLifetime, printMode,
-    patient: "Asha Das", items: paperItems
-  };
+  const pass = referralPass(id, clinic, issued, issued + passLifetime, printMode, paperItems);
+  const signed = await signedQr(pass);
+  if (user) await registerPass(pass, items, user);
+  return { ...signed, ...(printMode === "minimal" && { onlineItems: items }) };
+}
+
+function referralPass(id, clinic, issued, expires, printMode, items) {
+  return { v: 1, id, issuer: "Cedar Health", clinic, issued, expires, printMode, patient: "Asha Das", items };
+}
+
+async function signedQr(pass) {
   const bytes = Buffer.from(JSON.stringify(pass));
   const token = bytes.toString("base64url") + "." + sign(null, bytes, privateKey).toString("base64url");
   const qr = await qrcode.toDataURL(token, { errorCorrectionLevel: "M", margin: 4, scale: 7 });
-  if (user) await registerPass(pass, items, user);
-  return { pass, token, qr, ...(printMode === "minimal" && { onlineItems: items }) };
+  return { pass, token, qr };
 }
 
 function checkedPass({ token, clinic }, allowExpired = false) {
@@ -108,12 +114,55 @@ export function requestOrigin(req) {
 }
 
 const getRoutes = ["/api/key", "/api/session", "/api/referrals", "/healthz"];
-const postRoutes = ["/api/login", "/api/logout", "/api/issue", "/api/check", "/api/accept", "/api/details", "/api/manage"];
+const postRoutes = ["/api/login", "/api/signup", "/api/logout", "/api/issue", "/api/check", "/api/accept", "/api/details", "/api/manage",
+  "/api/recover", "/api/appointment"];
 
 function checkReferralId(id) {
   if (typeof id !== "string" || !id.trim() || id.length > 80) {
     throw new RequestError(400, "Choose a referral.");
   }
+}
+
+async function recover({ id }, user) {
+  if (user.clinic) throw new RequestError(403, "Only the patient can recover a referral QR.");
+  checkReferralId(id);
+  const row = await patientReferral(id, user);
+  if (!row) throw new RequestError(404, "The issuer could not find this referral.");
+  const expires = Date.parse(row.expires_at);
+  if (expires <= Date.now()) throw new RequestError(410, "This QR expired. Review a fresh referral to share again.");
+  if (!["full", "minimal"].includes(row.print_mode) || !Array.isArray(row.paper_ids) || !Array.isArray(row.items)) {
+    throw new RequestError(409, "This referral predates QR recovery. Review a fresh referral to share again.");
+  }
+  // Restore the original item order and key order after the JSONB round trip.
+  const items = row.paper_ids.map(paperId => row.items.find(item => item.id === paperId));
+  if (items.some(item => !item || (row.print_mode === "minimal" && item.id !== "result"))) {
+    throw new RequestError(409, "The printed contents could not be recovered. Review a fresh referral to share again.");
+  }
+  const paper = items.map(({ id, label, text }) => ({ id, label, text }));
+  return signedQr(referralPass(row.id, row.clinic, Date.parse(row.issued_at), expires, row.print_mode, paper));
+}
+
+async function appointment({ id, action, proposalId = null, startsAt, instructions = "" }, user) {
+  checkReferralId(id);
+  if (!["propose", "confirm", "reschedule"].includes(action)) throw new RequestError(400, "Choose an appointment action.");
+  if (Boolean(user.clinic) !== (action === "propose")) {
+    throw new RequestError(403, "This account cannot take that appointment action.");
+  }
+  if ((action !== "propose" || proposalId !== null) &&
+      (typeof proposalId !== "string" || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(proposalId))) {
+    throw new RequestError(400, "Choose the current appointment proposal.");
+  }
+  if (action === "propose") {
+    if (typeof startsAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(startsAt) ||
+        !Number.isFinite(Date.parse(startsAt)) || new Date(startsAt).toISOString() !== startsAt || Date.parse(startsAt) <= Date.now()) {
+      throw new RequestError(400, "Choose a future appointment time.");
+    }
+    if (typeof instructions !== "string" || [...instructions.trim()].length > 400) {
+      throw new RequestError(400, "Keep the appointment instructions to 400 characters or less.");
+    }
+  }
+  return changeAppointment(id, user, action, proposalId, action === "propose" ? startsAt : null,
+    action === "propose" ? instructions.trim() : null);
 }
 
 async function manage({ id, action, reason }, user) {
@@ -155,6 +204,7 @@ export async function handleApi(req, res, path) {
       throw new RequestError(503, "Email sign-in and sync have not been configured.");
     }
     const secure = origin.startsWith("https:");
+    if (path === "/api/signup") return send(res, 200, await signUp(data, origin));
     if (path === "/api/login") return send(res, 200, await signIn(data, res, secure));
     if (path === "/api/logout") return send(res, 200, await signOut(req, res, secure));
     const user = await userFor(req);
@@ -166,6 +216,8 @@ export async function handleApi(req, res, path) {
       return send(res, 200, await issue(data, user));
     }
     if (path === "/api/manage") return send(res, 200, await manage(data, user));
+    if (path === "/api/recover") return send(res, 200, await recover(data, user));
+    if (path === "/api/appointment") return send(res, 200, await appointment(data, user));
     if (!user.clinic) throw new RequestError(403, "A clinic account is required.");
     if (path === "/api/details") {
       const { token, id, purpose = "view" } = data;

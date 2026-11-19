@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#252238">
+  <meta name="theme-color" content="#12352f">
   <title>DoosriParchi</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/jsqr.js" defer></script>
@@ -14,23 +14,51 @@
     <div class="mast-inner">
       <a class="brand" href="#patient"><span class="mark" aria-hidden="true"></span>DoosriParchi</a>
       <nav aria-label="Workspace">
-        <a href="#patient" id="patient-link">Patient</a>
-        <a href="#clinic" id="clinic-link">Receiving clinic</a>
+        <a href="#patient" id="patient-link" hidden>Patient</a>
+        <a href="#clinic" id="clinic-link" hidden>Receiving clinic</a>
       </nav>
       <span class="demo">Synthetic case</span>
     </div>
   </header>
   <main id="main">
+    <section class="entry-layout" id="entry-layout" aria-labelledby="entry-title">
+      <div class="entry-intro">
+        <h1 id="entry-title">A referral you control.</h1>
+        <p>Choose what goes on paper, keep selected details online, and see when the clinic accepts your referral.</p>
+        <div class="entry-slip" aria-label="Example referral for North Clinic">
+          <div class="entry-slip-head"><strong>Follow-up referral</strong><span>North Clinic</span></div>
+          <dl><div><dt>Hemoglobin result</dt><dd>On the QR</dd></div><div><dt>Referral note</dt><dd>Clinic sign-in required</dd></div></dl>
+        </div>
+      </div>
+      <div class="entry-form">
+        <div id="session-check">
+          <p id="session-status" role="status">Checking your connection…</p>
+          <button id="retry-session" type="button" class="secondary" hidden>Retry connection</button>
+        </div>
+        <div id="auth-forms" hidden>
+          <h2 id="auth-title">Sign in</h2>
+          <p id="auth-description">Use your patient or clinic account.</p>
+          <form id="login-form">
+            <label>Email<input type="email" name="email" autocomplete="username" required maxlength="254"></label>
+            <label>Password<input type="password" name="password" autocomplete="current-password" required maxlength="256"></label>
+            <button type="submit">Sign in</button>
+          </form>
+          <form id="signup-form" hidden>
+            <label>Email<input type="email" name="email" autocomplete="username" required maxlength="254"></label>
+            <label>Password<input type="password" name="password" autocomplete="new-password" required minlength="10" maxlength="72" aria-describedby="password-hint"></label>
+            <p id="password-hint" class="muted">At least 10 characters.</p>
+            <button type="submit">Create patient account</button>
+          </form>
+          <p id="auth-message" class="message" role="status"></p>
+          <div class="entry-switch"><button id="toggle-auth" type="button" class="secondary">Create a patient account</button></div>
+        </div>
+      </div>
+    </section>
     <section class="account-panel" id="account-panel" hidden aria-label="Account">
       <div id="account-summary"></div>
-      <form id="login-form" hidden>
-        <label>Email<input type="email" name="email" autocomplete="username" required maxlength="254"></label>
-        <label>Password<input type="password" name="password" autocomplete="current-password" required maxlength="256"></label>
-        <button type="submit">Sign in</button>
-      </form>
       <p id="account-message" class="message" role="status"></p>
     </section>
-    <section id="patient">
+    <section id="patient" hidden>
       <div class="intro patient-intro">
         <h1>Send a referral</h1>
         <ol class="progress" aria-label="Referral progress">

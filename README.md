@@ -25,6 +25,8 @@ Run `node scripts/rehearse.mjs` for a loopback rehearsal with synthetic accounts
 4. **Receive.** Turn off networking on the clinic device. Scan the printed code or open the saved QR image and accept the referral for intake. The pending acceptance stays on that device until it reconnects. Reconnect and verify that the patient sees the timestamp and that a second scan creates only one intake row. A receipt confirms intake, while appointment scheduling is a separate clinic step.
 5. **Change the sharing decision.** While the receiving clinic is offline, open the patient's sharing view for this referral and withdraw the online note. Use the same QR after reconnecting. Intake still works. Inspect the clinic detail view and export the FHIR bundle to verify that the note is absent from both.
 6. **Request a previous result.** In clinic intake, request the previous hemoglobin measurement and explain why it is needed. The patient can preview the measurement and approve or decline the request. On approval, the clinic can retrieve the additional result. Open the patient's timeline to see when the clinic requested information and when the server released it.
+7. **Agree on an appointment.** After intake syncs, open the referral in the clinic workspace and propose a time with preparation instructions. The patient can confirm or ask for another time from **Review sharing**. The appointment stays visible after the referral QR expires.
+8. **Recover the QR.** Reload the patient workspace and open **Review sharing → Show signed QR**. Download the same pass with its original recipient, printed contents, and expiry. If the pass has expired, **Review a fresh referral** opens a draft from the previous choices for a new consent decision.
 
 Anyone with the QR image can decode its contents. Full mode includes all selected items. Minimal mode contains the synthetic patient name, clinic, pass metadata and the lab result if selected. The rest of the approved content can be requested by the authenticated matching clinic with the signed pass. The signature authenticates the issued content and detects edits. The 24-hour expiry limits how long the workspace accepts a new pass. Sync pending acceptances before expiry.
 
@@ -40,11 +42,13 @@ Anyone with the QR image can decode its contents. Full mode includes all selecte
      ('<north-clinic-auth-uuid>', 'north');
    ```
 
-   Optionally add a separate South Clinic account with `clinic = 'south'` for the wrong-recipient demonstration. Disable public sign-ups for the demo project unless another workflow needs them.
+   Optionally add a separate South Clinic account with `clinic = 'south'` for the wrong-recipient demonstration. Public signup creates patient workspaces only. The server provisions a patient workspace on the first verified email/password sign-in.
 3. Connect the repository to a Vercel project with this directory as its root. Use the included `vercel.json` and set `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` and `REFERRAL_SIGNING_KEY` in the intended deployment environment. For an additional custom origin, set `PUBLIC_ORIGIN`. Keep the secret and signing keys server-side. The application accepts the Vercel deployment URLs exposed through Vercel system environment variables.
 4. Open the deployed HTTPS URL on both devices and sign into separate accounts. The clinic needs to load the app and issuer key online once per device. If a clinic session expires, sign back into the same account to sync pending work. The patient and clinic views refresh status while visible and online.
 
 The Supabase tables hold referral intake metadata and the patient-approved items. The server uses the Supabase secret key after checking ownership or clinic membership. The browser receives a same-origin, HttpOnly access cookie. The app shell and issuer key are available offline, while authenticated responses are requested fresh.
+
+For public patient signup, enable email/password signup and email confirmation in Supabase Auth. Set the Site URL to the production origin and allow the exact confirmation redirect (for example, `https://doosriparchi.vercel.app/?auth=confirmed`). Configure a custom SMTP provider for visitors outside the Supabase organization. Supabase’s built-in mailer is limited to authorized team addresses. Clinic roles are assigned through the SQL step above.
 
 ## Deploy the synthetic demo
 

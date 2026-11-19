@@ -120,8 +120,83 @@ test("a receipt reaches another patient device and repeated clinic acceptance is
   const inbox = (await north.read("/api/referrals")).referrals.find(row => row.id === pass.id);
   assert.deepEqual(inbox, {
     id: pass.id, clinic: pass.clinic, issued_at: new Date(pass.issued).toISOString(),
-    expires_at: new Date(pass.expires).toISOString(), accepted_at: accepted.receipt.accepted_at
+    expires_at: new Date(pass.expires).toISOString(), accepted_at: accepted.receipt.accepted_at, appointment: null
   });
+});
+
+test("a confirmed signup gets a patient workspace and cannot choose a clinic role", async () => {
+  const visitor = device();
+  const email = "new-patient@example.test";
+  const password = "test-signup-password";
+  const credentials = { email, password };
+  assert.equal((await visitor.request("/api/signup", { email, password: "short" })).status, 400);
+  const requested = await visitor.request("/api/signup", { ...credentials, clinic: "north" });
+  assert.equal(requested.status, 200);
+  assert.equal(requested.headers.get("set-cookie"), null);
+  assert.deepEqual(await requested.json(), { checkEmail: true });
+  const signup = database.calls.find(call => call.path === "/auth/v1/signup" && call.body.email === email);
+  assert.equal(signup.query.get("redirect_to"), base + "/?auth=confirmed");
+  assert.deepEqual(Object.keys(signup.body).sort(), ["email", "password"]);
+  assert.deepEqual(await visitor.read("/api/signup", credentials), { checkEmail: true });
+  assert.deepEqual(await visitor.read("/api/signup", { email: "north@example.test", password }), { checkEmail: true });
+  assert.equal((await visitor.request("/api/login", credentials)).status, 401);
+  database.confirmEmail(email);
+  const secondDevice = device();
+  const signedIn = await Promise.all([visitor, secondDevice].map(browser => browser.read("/api/login", credentials)));
+  assert.deepEqual(signedIn[0], signedIn[1]);
+  assert.equal(signedIn[0].user.clinic, null);
+  const { pass, token } = await visitor.read("/api/issue", draft);
+  assert.equal((await visitor.request("/api/accept", { token })).status, 403);
+  assert.equal((await secondDevice.read("/api/referrals")).referrals[0].id, pass.id);
+});
+
+test("QR recovery recreates the original paper pass and stays scoped to its patient", async () => {
+  const owner = device(), stranger = device(), clinic = device();
+  await owner.login("patient@example.test");
+  await stranger.login("patient2@example.test");
+  await clinic.login("north@example.test");
+  const original = await owner.read("/api/issue", { ...draft, printMode: "minimal" });
+  const { id } = original.pass;
+  const row = database.rows.get(id);
+  row.items = row.items.map(({ id, label, text }) => ({ id, text, label }));
+  await owner.manage(id, "withdraw");
+  const recovered = await owner.read("/api/recover", { id });
+  assert.deepEqual(recovered, { pass: original.pass, token: original.token, qr: original.qr });
+  assert.equal((await stranger.request("/api/recover", { id })).status, 404);
+  assert.equal((await clinic.request("/api/recover", { id })).status, 403);
+  row.expires_at = new Date(Date.now() - 1000).toISOString();
+  assert.equal((await owner.request("/api/recover", { id })).status, 410);
+});
+
+test("appointments require intake, preserve clinic boundaries and reject stale confirmations", async () => {
+  const [patient, north, south, other] = Array.from({ length: 4 }, () => device());
+  await Promise.all([patient.login("patient@example.test"), north.login("north@example.test"),
+    south.login("south@example.test"), other.login("patient2@example.test")]);
+  const { pass: { id }, token } = await patient.read("/api/issue", draft);
+  const startsAt = new Date(Date.now() + 86400000).toISOString();
+  const offer = { id, action: "propose", startsAt, instructions: "Bring your referral slip." };
+  assert.equal((await north.request("/api/appointment", offer)).status, 409);
+  await north.read("/api/accept", { token });
+  assert.equal((await patient.request("/api/appointment", offer)).status, 403);
+  assert.equal((await south.request("/api/appointment", offer)).status, 404);
+  assert.equal((await north.request("/api/appointment", { ...offer, startsAt: "2026-02-30T10:00:00.000Z" })).status, 400);
+  const { appointment: first } = await north.read("/api/appointment", offer);
+  const answer = { id, proposalId: first.id, action: "confirm" };
+  assert.equal((await other.request("/api/appointment", answer)).status, 404);
+  assert.equal((await north.request("/api/appointment", answer)).status, 403);
+  const { appointment: waiting } = await patient.read("/api/appointment", { ...answer, action: "reschedule" });
+  assert.equal(waiting.status, "reschedule_requested");
+  const newOffer = { ...offer, proposalId: first.id, startsAt: new Date(Date.now() + 172800000).toISOString() };
+  const { appointment: second } = await north.read("/api/appointment", newOffer);
+  assert.equal((await patient.request("/api/appointment", answer)).status, 409);
+  database.rows.get(id).expires_at = new Date(Date.now() - 1000).toISOString();
+  const confirm = { ...answer, proposalId: second.id };
+  const confirmed = await patient.read("/api/appointment", confirm);
+  assert.equal(confirmed.appointment.status, "confirmed");
+  assert.deepEqual(await patient.read("/api/appointment", confirm), confirmed);
+  const { referrals } = await north.read("/api/referrals");
+  assert.deepEqual(referrals.find(row => row.id === id).appointment, confirmed.appointment);
+  assert.equal((await north.request("/api/appointment", { ...newOffer, proposalId: second.id })).status, 409);
 });
 
 test("patient and clinic lists are isolated and the signed recipient controls detail access", async () => {

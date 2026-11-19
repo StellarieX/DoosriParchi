@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { once } from "node:events";
+import { randomUUID } from "node:crypto";
 
 export const mockPublishableKey = "sb_publishable_test";
 export const mockSecretKey = "sb_secret_test";
@@ -79,10 +80,34 @@ function manageReferral(row, account, { manage_action: action, request_reason: r
   } };
 }
 
+function appointmentUpdate(row, account, { decision, expected_proposal, proposed_start, preparation }) {
+  if (!row || !account || (account.clinic ? account.clinic !== row.clinic : account.id !== row.patient_id)) {
+    return error(404, "Referral unavailable.");
+  }
+  if (Boolean(account.clinic) !== (decision === "propose")) return error(403, "Action unavailable.");
+  if (!row.accepted_at) return error(409, "Accept the referral first.");
+  const slot = row.appointment;
+  if ((slot?.id ?? null) !== expected_proposal) return error(409, "The appointment changed.");
+  if (decision === "propose") {
+    if (slot?.status === "confirmed") return error(409, "This appointment is already confirmed.");
+    row.appointment = { id: randomUUID(), status: "proposed", startsAt: proposed_start, instructions: preparation };
+  } else {
+    const status = decision === "confirm" ? "confirmed" : "reschedule_requested";
+    if (slot?.status === status) return { appointment: slot };
+    if (slot?.status !== "proposed" || (decision === "confirm" && Date.parse(slot.startsAt) <= Date.now())) {
+      return error(409, "There is no active appointment proposal to answer.");
+    }
+    row.appointment = { ...slot, status };
+  }
+  return { appointment: row.appointment };
+}
+
 export async function startMockSupabase() {
   const rows = new Map();
   const tokens = new Map();
   const calls = [];
+  const workspaceAccounts = new Map(accounts.map(account => [account.id, account]));
+  const signups = new Map();
   let nextToken = 1;
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, "http://localhost");
@@ -96,12 +121,23 @@ export async function startMockSupabase() {
     };
     if (url.pathname.startsWith("/auth/")) {
       if (request.headers.apikey !== mockPublishableKey) return send(401, { message: "Invalid publishable key" });
+      if (url.pathname === "/auth/v1/signup") {
+        if (accounts.some(account => account.email === body.email) || signups.has(body.email)) {
+          return send(422, { error_code: "user_already_exists" });
+        }
+        const user = { id: "signup-" + (signups.size + 1), email: body.email, app_metadata: { provider: "email" } };
+        signups.set(body.email, { user, password: body.password });
+        return send(200, user);
+      }
       if (url.pathname === "/auth/v1/token") {
-        const user = accounts.find(account => account.email === body.email);
-        if (!user || body.password !== "demo-password") return send(400, { message: "Invalid credentials" });
+        const signup = signups.get(body.email);
+        const user = signup?.user ?? accounts.find(account => account.email === body.email);
+        if (!user || body.password !== (signup?.password ?? "demo-password")) return send(400, { message: "Invalid credentials" });
+        if (signup && !user.email_confirmed_at) return send(400, { error_code: "email_not_confirmed" });
         const token = "test-token-" + nextToken++;
         tokens.set(token, user);
-        return send(200, { access_token: token, expires_in: 3600, user: { id: user.id, email: user.email } });
+        const { id, email, email_confirmed_at, app_metadata } = user;
+        return send(200, { access_token: token, expires_in: 3600, user: { id, email, email_confirmed_at, app_metadata } });
       }
       const token = request.headers.authorization?.replace(/^Bearer /, "");
       const user = tokens.get(token);
@@ -115,13 +151,17 @@ export async function startMockSupabase() {
     if (url.pathname.startsWith("/rest/")) {
       if (request.headers.apikey !== mockSecretKey) return send(401, { message: "Service key required" });
       if (url.pathname === "/rest/v1/referral_accounts") {
-        return send(200, accounts.filter(account => "eq." + account.id === url.searchParams.get("user_id"))
-          .map(account => ({ clinic: account.clinic })));
+        if (request.method === "POST") {
+          if (!workspaceAccounts.has(body.user_id)) workspaceAccounts.set(body.user_id, { id: body.user_id, clinic: body.clinic });
+          return send(201, []);
+        }
+        const account = workspaceAccounts.get(url.searchParams.get("user_id")?.slice(3));
+        return send(200, account ? [{ clinic: account.clinic }] : []);
       }
       if (url.pathname === "/rest/v1/referral_intake" && request.method === "POST") {
         if (rows.has(body.id)) return send(409, { message: "Duplicate referral" });
         const row = {
-          ...body, accepted_at: null, accepted_by: null, withdrawn: false, request: null, events: []
+          ...body, accepted_at: null, accepted_by: null, appointment: null, withdrawn: false, request: null, events: []
         };
         addEvent(row, "issued", row.paper_ids, row.issued_at);
         rows.set(row.id, row);
@@ -141,7 +181,7 @@ export async function startMockSupabase() {
       }
       if (url.pathname === "/rest/v1/rpc/accept_referral") {
         const row = rows.get(body.referral_id);
-        const account = accounts.find(account => account.id === body.staff_user);
+        const account = workspaceAccounts.get(body.staff_user);
         if (!row || !account?.clinic || row.clinic !== account.clinic ||
             (!row.accepted_at && expired(row))) return send(200, []);
         if (!row.accepted_at) {
@@ -152,12 +192,15 @@ export async function startMockSupabase() {
         return send(200, [{ id: row.id, accepted_at: row.accepted_at }]);
       }
       if (url.pathname === "/rest/v1/rpc/referral_details") {
-        const account = accounts.find(account => account.id === body.staff_user);
+        const account = workspaceAccounts.get(body.staff_user);
         return send(200, referralDetails(rows.get(body.referral_id), account, body));
       }
       if (url.pathname === "/rest/v1/rpc/manage_referral") {
-        const account = accounts.find(account => account.id === body.actor_user);
+        const account = workspaceAccounts.get(body.actor_user);
         return send(200, manageReferral(rows.get(body.referral_id), account, body));
+      }
+      if (url.pathname === "/rest/v1/rpc/referral_appointment") {
+        return send(200, appointmentUpdate(rows.get(body.referral_id), workspaceAccounts.get(body.actor_user), body));
       }
     }
     send(404, { message: "Unimplemented mock route" });
@@ -168,6 +211,7 @@ export async function startMockSupabase() {
     url: "http://127.0.0.1:" + server.address().port,
     rows,
     calls,
+    confirmEmail: email => { signups.get(email).user.email_confirmed_at = new Date().toISOString(); },
     close: () => new Promise((resolve, reject) => {
       server.close(error => error ? reject(error) : resolve());
       server.closeAllConnections();
