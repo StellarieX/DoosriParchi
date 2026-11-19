@@ -637,8 +637,8 @@ function timelineMarkup(review, clinic, isClinic) {
   };
   return `<section class="activity-timeline"><h3>Referral timeline</h3><ol>${[...review.events].reverse().map(event => {
     const items = event.itemIds?.map(id => recordLabels[id]).filter(Boolean).join(", ");
-    return `<li><time datetime="${safe(new Date(event.at).toISOString())}">${safe(eventTime.format(new Date(event.at)))}</time>
-      <strong>${safe(titles[event.kind] ?? "Referral updated")}</strong>
+    return `<li><strong>${safe(titles[event.kind] ?? "Referral updated")}</strong>
+      <time datetime="${safe(new Date(event.at).toISOString())}">${safe(eventTime.format(new Date(event.at)))}</time>
       ${items && ["view", "export"].includes(event.kind) ? `<small>${safe(items)}</small>` : ""}</li>`;
   }).join("")}</ol></section>`;
 }
