@@ -1,6 +1,8 @@
 # DoosriParchi
 
-Health Hack MVP. A patient previews the exact outgoing referral, confirms their understanding in English or Hindi, and hands a signed QR pass to the receiving clinic. The clinic can verify the pass offline, accept it for intake, and export the referral as a FHIR R4 bundle. The patient sees the acceptance after the clinic reconnects.
+DoosriParchi is a Health Hack prototype for patient-controlled referrals. Patients choose what to share on paper and online, confirm their choices in English or Hindi, and hand the clinic a signed QR. The clinic can verify the QR offline. With a minimal offline copy, it can also queue intake and sync the acceptance when it reconnects. Online FHIR R4 exports come with a signed receipt the patient can see in their referral timeline.
+
+[Live demo](https://doosriparchi.vercel.app) · [Release history](https://github.com/StellarieX/DoosriParchi/releases)
 
 ## Run locally
 
@@ -19,15 +21,17 @@ Run `node scripts/rehearse.mjs` for a loopback rehearsal with synthetic accounts
 
 ## Demo
 
+The patient switches between **Send referral** and **Your referrals**. The clinic switches between **Scan referral** and **Clinic intake**. Opening a referral shows its details in a focused view with a back button to the list.
+
 1. **Patient.** The medical history box is unchecked, yet the preview highlights the same history in the referral note. Select **Use a note without medical history** and check the updated preview.
 2. **Confirm.** Select English or Hindi. Use **Listen to summary** on a device with a local voice for that language. Answer **Yes** first to show the mismatch, then **No** to issue the pass.
 3. **Share.** Preview **Private QR**, the default for signed-in patients. It carries a signed referral reference. The receiving clinic signs in online and selects **Load patient-approved details** to open the record. To demonstrate offline intake, choose **Minimal offline copy** during preview, issue the pass, and save or print the QR. Sign in as North Clinic on the receiving device and wait for the offline readiness message.
-4. **Receive.** Turn off networking on the clinic device. Scan the printed code or open the saved QR image and accept the referral for intake. The pending acceptance stays on that device until it reconnects. Reconnect and verify that the patient sees the timestamp and that a second scan creates only one intake row. A receipt confirms intake, while appointment scheduling is a separate clinic step.
-5. **Change the sharing decision.** While the receiving clinic is offline, open the patient's sharing view for this referral and withdraw the online note. Use the same QR after reconnecting. Intake still works. Inspect the clinic detail view and export the FHIR bundle to verify that the note is absent from both.
-6. **Request a previous result.** In clinic intake, request the previous hemoglobin measurement and explain why it is needed. The patient can preview the measurement and approve or decline the request. On approval, the clinic can retrieve the additional result. Open the patient's timeline to see when the clinic requested information and when the server released it.
-7. **Agree on an appointment.** After intake syncs, open the referral in the clinic workspace and propose a time with preparation instructions. The patient can confirm or ask for another time from **Review sharing**. The appointment stays visible after the referral QR expires.
+4. **Receive.** Turn off networking on the clinic device. Under **Scan referral**, scan the printed code or open the saved QR image and select **Accept referral**. **Clinic intake** shows the pending acceptance. Reconnect and confirm the timestamp appears in **Your referrals**. Scanning the same QR again creates one intake entry in total. **Accepted for intake** means the clinic received the referral and can offer an appointment.
+5. **Export and withdraw.** After reconnecting, select **Open intake** and download the FHIR bundle and its signed receipt. In **Your referrals → Review sharing**, withdraw the online referral note. Download a second export and receipt from the same clinic intake entry. The second bundle omits the note, and the patient’s timeline keeps both receipts.
+6. **Request a previous result.** In clinic intake, open **Request previous hemoglobin**, enter the reason, and select **Send request**. The patient can preview the result and choose whether to share it. Once approved, the result can appear in subsequent clinic exports.
+7. **Agree on an appointment.** From the clinic intake entry, select **Propose a time**, enter a date and time, and send the offer. The patient can confirm or ask for another time from **Review sharing**. The appointment stays visible after the referral QR expires.
 8. **Recover the QR.** Reload the patient workspace and open **Review sharing → Show signed QR**. Download the same pass with its original recipient, printed contents, and expiry. If the pass has expired, **Review a fresh referral** opens a draft from the previous choices for a new consent decision.
-9. **Verify an export.** From clinic intake, download the FHIR bundle and select **Save signed receipt**. Open **Verify export**, select both files, and try changing a field. The verifier checks the exact file bytes alongside the issuer’s signature, entirely in the browser. The patient can also save the signed receipt from the referral timeline. After withdrawing an online-only note, download a new export from the same referral and compare its receipt with the earlier one.
+9. **Verify an export.** Open **Verify export** and select a FHIR bundle and its matching signed receipt. Then try changing a field or pairing the bundle with the other receipt. The verifier checks the exact bytes and the issuer’s signature in the browser. It can verify offline once the browser has loaded the issuer’s public key.
 
 An online export receipt identifies the referral, receiving clinic, and preparation time and contains a SHA-256 fingerprint of the FHIR file. Verification uses this deployment’s issuer key. Reformatting or editing the file changes its fingerprint. Each receipt verifies one export and can be checked after consent changes. Offline downloads contain the QR’s printed information and have the QR signature as their source evidence.
 
