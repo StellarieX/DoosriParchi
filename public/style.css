@@ -58,10 +58,28 @@ p { line-height: 1.5; margin: 8px 0 16px; }
 select, textarea { border: 1px solid var(--control); background: var(--paper); color: inherit; border-radius: 7px; padding: 10px 11px; width: 100%; font: inherit; font-size: .92rem; }
 fieldset { margin: 23px 0 15px; padding: 0; border: 0; }
 legend { font-size: .82rem; font-weight: 650; margin-bottom: 7px; }
-.field { display: flex; align-items: flex-start; gap: 11px; padding: 12px 0; border-top: 1px solid var(--line); cursor: pointer; font-size: .9rem; }
-.field:last-child { border-bottom: 1px solid var(--line); }
-.field input, .answer input { flex: none; width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--accent); }
+.field {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  cursor: pointer;
+  font-size: .9rem;
+}
+.field + .field { margin-top: 7px; }
+.field:has(input:checked) { border-color: #78a797; background: var(--mint); }
+.field:has(input:focus-visible) { outline: 2px solid #275c9a; outline-offset: 2px; }
+.field input { flex: none; width: 20px; height: 20px; margin: 0; accent-color: var(--accent); cursor: inherit; }
+.field:has(input:focus-visible) input { outline: none; }
+.field strong { font-weight: 650; }
 .field small { display: block; color: var(--muted); margin-top: 3px; line-height: 1.35; font-size: .79rem; }
+@media (hover: hover) {
+  .field:hover { border-color: var(--accent); }
+}
 .document-tray {
   padding: clamp(13px, 2.5vw, 29px);
   background: linear-gradient(138deg, #e0f2e8, #e7effa);
@@ -112,6 +130,7 @@ button:hover:not(:disabled), .button:hover { filter: brightness(.91); }
 .message { font-size: .9rem; }
 .readback { background: var(--sky); border-left: 3px solid #789ac8; padding: 13px 15px; margin: 14px 0; line-height: 1.6; font-size: .93rem; }
 .answer { display: flex; align-items: flex-start; gap: 9px; padding: 7px 0; }
+.answer input { flex: none; width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--accent); }
 details { margin-top: 17px; }
 summary { color: var(--accent); cursor: pointer; font-size: .86rem; }
 textarea { resize: vertical; }
